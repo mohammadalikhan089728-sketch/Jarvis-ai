@@ -147,6 +147,12 @@
             android:name=".FloatingOrbService"
             android:exported="false" />
 
+        <!-- Persistent Active Live Voice Assistant Service (Works across Home screen & all apps) -->
+        <service
+            android:name=".JarvisActiveAssistantService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
         <!-- Always-On Background Wake Word Foreground Service -->
         <service
             android:name=".JarvisWakeWordService"

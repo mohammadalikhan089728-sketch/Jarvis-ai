@@ -2,26 +2,17 @@ package com.example
 
 import android.Manifest
 import android.app.Application
-import android.content.Intent
 import android.content.pm.PackageManager
-import android.os.Bundle
-import android.os.SystemClock
 import android.provider.Settings
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -61,52 +52,34 @@ sealed interface KeyVerificationUiState {
     data class Failed(val reason: String) : KeyVerificationUiState
 }
 
+/**
+ * Coordinates UI state with JarvisActiveAssistantService (so continuous hands-free voice sessions
+ * keep running seamlessly after going to Home screen or opening YouTube/WhatsApp/Settings),
+ * Local Room DB, MicCoordinator, Scheduled Calls, and Diagnostics.
+ */
 class JarvisViewModel(application: Application) : AndroidViewModel(application) {
 
     private val appContext = application.applicationContext
     private val database = JarvisDatabase.getInstance(appContext)
     private val repository = JarvisRepository(database)
     private val aiClient = GeminiApiClient()
-    private val offlineProcessor = OfflineCommandProcessor(appContext)
-    private val agentEngine = JarvisAgentEngine(appContext, repository, aiClient, offlineProcessor)
-    val voiceEngine = VoiceEngineManager(appContext, aiClient)
+    private val previewVoiceEngine = VoiceEngineManager(appContext, aiClient)
 
-    private var speechRecognizer: SpeechRecognizer? = null
-    private var isRecognizerListening = false
-    private var passiveWakeMode = false
-
-    @Volatile
-    private var lastSpeechDetectedTimestamp: Long = 0L
-    private var inactivityWatchdogJob: Job? = null
-    private var restartListeningJob: Job? = null
-    private var activeCommandJob: Job? = null
-
-    private val _isLiveSessionActive = MutableStateFlow(false)
-    val isLiveSessionActive: StateFlow<Boolean> = _isLiveSessionActive.asStateFlow()
-
-    private val _inactivityRemainingMs = MutableStateFlow(INACTIVITY_TIMEOUT_MS)
-    val inactivityRemainingMs: StateFlow<Long> = _inactivityRemainingMs.asStateFlow()
-
-    private val _isAutoSleepStandby = MutableStateFlow(false)
-    val isAutoSleepStandby: StateFlow<Boolean> = _isAutoSleepStandby.asStateFlow()
-
-    private val _phase = MutableStateFlow(JarvisPhase.IDLE)
-    val phase: StateFlow<JarvisPhase> = _phase.asStateFlow()
-
-    private val _voiceRmsDb = MutableStateFlow(0f)
-    val voiceRmsDb: StateFlow<Float> = _voiceRmsDb.asStateFlow()
-
-    private val _liveTranscript = MutableStateFlow("")
-    val liveTranscript: StateFlow<String> = _liveTranscript.asStateFlow()
-
-    private val _statusBanner = MutableStateFlow("JARVIS Core online • Developed by Mozahid")
-    val statusBanner: StateFlow<String> = _statusBanner.asStateFlow()
-
+    private val _localStatusBanner = MutableStateFlow("JARVIS Core online • Developed by Mozahid")
     private val _keyVerificationState = MutableStateFlow<KeyVerificationUiState>(KeyVerificationUiState.Idle)
     val keyVerificationState: StateFlow<KeyVerificationUiState> = _keyVerificationState.asStateFlow()
 
     private val _permissionsState = MutableStateFlow(PermissionsSnapshot())
     val permissionsState: StateFlow<PermissionsSnapshot> = _permissionsState.asStateFlow()
+
+    // Live continuous session state mirrored directly from JarvisActiveAssistantService
+    val isLiveSessionActive: StateFlow<Boolean> = JarvisActiveAssistantService.isSessionActive
+    val phase: StateFlow<JarvisPhase> = JarvisActiveAssistantService.phase
+    val voiceRmsDb: StateFlow<Float> = JarvisActiveAssistantService.voiceRmsDb
+    val inactivityRemainingMs: StateFlow<Long> = JarvisActiveAssistantService.inactivityRemainingMs
+    val isAutoSleepStandby: StateFlow<Boolean> = JarvisActiveAssistantService.isAutoSleepStandby
+    val liveTranscript: StateFlow<String> = JarvisActiveAssistantService.liveTranscript
+    val statusBanner: StateFlow<String> = _localStatusBanner.asStateFlow()
 
     val settings: StateFlow<SettingsEntity> = repository.settingsFlow
         .map { it ?: SettingsEntity() }
@@ -131,175 +104,16 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     val isMultiStepRunning: StateFlow<Boolean> = JarvisAccessibilityService.isMultiStepRunning
     val multiStepStatus: StateFlow<String> = JarvisAccessibilityService.currentStepStatus
     val lastAutoReplyBanner: StateFlow<String> = JarvisNotificationListenerService.lastAutoReplyBanner
-    val activeVoiceLabel: StateFlow<String> = voiceEngine.activeVoiceLabel
-    val lastVoiceStatus: StateFlow<String> = voiceEngine.lastVoiceStatus
+    val activeVoiceLabel: StateFlow<String> = previewVoiceEngine.activeVoiceLabel
+    val lastVoiceStatus: StateFlow<String> = previewVoiceEngine.lastVoiceStatus
     val overlayRunning: StateFlow<Boolean> = FloatingOrbService.isRunning
     val wakeWordServiceRunning: StateFlow<Boolean> = JarvisWakeWordService.isRunning
     val networkMonitorRunning: StateFlow<Boolean> = NetworkMonitorService.isRunning
-
-    val isReadyForAi: StateFlow<Boolean> = settings
-        .map { it.geminiApiKey.isNotBlank() }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
-
-    private val recognitionListener = object : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {
-            if (_isLiveSessionActive.value || passiveWakeMode) {
-                _phase.value = JarvisPhase.LISTENING
-            }
-        }
-
-        override fun onBeginningOfSpeech() {
-            markUserSpeechDetected()
-            _statusBanner.value = "LIVE • Receiving voice input…"
-        }
-
-        override fun onRmsChanged(rmsdB: Float) {
-            _voiceRmsDb.value = rmsdB.coerceIn(0f, 12f)
-        }
-
-        override fun onBufferReceived(buffer: ByteArray?) = Unit
-
-        override fun onEndOfSpeech() {
-            _voiceRmsDb.value = 0f
-            isRecognizerListening = false
-        }
-
-        override fun onError(error: Int) {
-            _voiceRmsDb.value = 0f
-            isRecognizerListening = false
-
-            if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
-                destroySpeechRecognizer()
-            } else {
-                stopSpeechRecognizerWindowOnly()
-            }
-
-            if (_isLiveSessionActive.value) {
-                if (isInactivityExpired()) {
-                    triggerAutoSleep()
-                    return
-                }
-                when (error) {
-                    SpeechRecognizer.ERROR_NO_MATCH,
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
-                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
-                    SpeechRecognizer.ERROR_CLIENT -> {
-                        _phase.value = JarvisPhase.LISTENING
-                        scheduleLiveRestart(SILENT_RESTART_DELAY_MS)
-                    }
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                        stopLiveSessionManual()
-                        _statusBanner.value = "Microphone permission denied."
-                    }
-                    else -> {
-                        _phase.value = JarvisPhase.LISTENING
-                        scheduleLiveRestart(350L)
-                    }
-                }
-                return
-            }
-
-            _phase.value = JarvisPhase.IDLE
-            JarvisWakeWordService.isMainAppListening.value = false
-            val msg = when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH -> "No speech detected."
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Listening timed out."
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission denied."
-                SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
-                    "Speech recognition network error."
-                else -> "Voice listener paused (code $error)."
-            }
-            _statusBanner.value = msg
-            if (passiveWakeMode && settings.value.wakeWordEnabled) {
-                viewModelScope.launch {
-                    delay(800L)
-                    if (settings.value.wakeWordEnabled && _phase.value == JarvisPhase.IDLE && !_isLiveSessionActive.value) {
-                        beginRecognitionWindow(wakeWordOnly = true)
-                    }
-                }
-            }
-        }
-
-        override fun onResults(results: Bundle?) {
-            _voiceRmsDb.value = 0f
-            isRecognizerListening = false
-            stopSpeechRecognizerWindowOnly()
-
-            val spoken = results
-                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull()
-                ?.trim()
-                .orEmpty()
-
-            if (spoken.isEmpty()) {
-                if (_isLiveSessionActive.value) {
-                    scheduleLiveRestart(SILENT_RESTART_DELAY_MS)
-                } else {
-                    _phase.value = JarvisPhase.IDLE
-                    JarvisWakeWordService.isMainAppListening.value = false
-                    maybeResumeWakeWordLoop()
-                }
-                return
-            }
-
-            markUserSpeechDetected()
-
-            if (passiveWakeMode && !_isLiveSessionActive.value) {
-                val lower = spoken.lowercase(Locale.ROOT)
-                val customWord = settings.value.customWakeWord.trim().ifBlank { "jarvis" }.lowercase(Locale.ROOT)
-                val wakeIndex = when {
-                    lower.contains(customWord) -> lower.indexOf(customWord) + customWord.length
-                    lower.contains("hey jarvis") -> lower.indexOf("hey jarvis") + "hey jarvis".length
-                    lower.contains("jarvis") -> lower.indexOf("jarvis") + "jarvis".length
-                    else -> -1
-                }
-                if (wakeIndex >= 0) {
-                    val extracted = spoken.substring(wakeIndex).trim().trimStart(',', ':', ' ')
-                    if (extracted.isNotEmpty()) {
-                        _liveTranscript.value = extracted
-                        submitCommand(extracted)
-                    } else {
-                        _isAutoSleepStandby.value = false
-                        _isLiveSessionActive.value = true
-                        JarvisWakeWordService.isMainAppListening.value = true
-                        lastSpeechDetectedTimestamp = SystemClock.elapsedRealtime()
-                        _inactivityRemainingMs.value = INACTIVITY_TIMEOUT_MS
-                        startInactivityWatchdog()
-                        voiceEngine.speak("Yes, sir. JARVIS live mode engaged.", settings.value) {
-                            scheduleLiveRestart(POST_SPEECH_RESTART_DELAY_MS)
-                        }
-                    }
-                } else {
-                    _phase.value = JarvisPhase.IDLE
-                    JarvisWakeWordService.isMainAppListening.value = false
-                    maybeResumeWakeWordLoop()
-                }
-            } else {
-                _liveTranscript.value = spoken
-                submitCommand(spoken)
-            }
-        }
-
-        override fun onPartialResults(partialResults: Bundle?) {
-            val partial = partialResults
-                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull()
-                ?.trim()
-                .orEmpty()
-            if (partial.isNotEmpty()) {
-                markUserSpeechDetected()
-                _liveTranscript.value = partial
-            }
-        }
-
-        override fun onEvent(eventType: Int, params: Bundle?) = Unit
-    }
 
     init {
         viewModelScope.launch {
             val loaded = repository.ensureDefaultsInitialized()
             refreshPermissions()
-            prewarmSpeechRecognizerIfPermitted()
             CallAlarmScheduler.rescheduleAllEnabledCalls(appContext)
             if (loaded.floatingOverlayEnabled && Settings.canDrawOverlays(appContext)) {
                 FloatingOrbService.start(appContext)
@@ -309,6 +123,14 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
             }
             if (loaded.onlineAutoCallEnabled) {
                 NetworkMonitorService.start(appContext)
+            }
+        }
+
+        viewModelScope.launch {
+            JarvisActiveAssistantService.statusBanner.collect { banner ->
+                if (banner.isNotBlank()) {
+                    _localStatusBanner.value = banner
+                }
             }
         }
 
@@ -326,20 +148,8 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
 
         viewModelScope.launch {
             JarvisNotificationListenerService.lastAutoReplyBanner.collect { msg ->
-                if (msg.isNotBlank() && _phase.value == JarvisPhase.IDLE) {
-                    _statusBanner.value = msg
-                }
-            }
-        }
-
-        viewModelScope.launch {
-            voiceEngine.isSpeaking.collect { speaking ->
-                if (speaking) {
-                    _phase.value = JarvisPhase.SPEAKING
-                } else if (_phase.value == JarvisPhase.SPEAKING && !_isLiveSessionActive.value) {
-                    _phase.value = JarvisPhase.IDLE
-                    JarvisWakeWordService.isMainAppListening.value = false
-                    maybeResumeWakeWordLoop()
+                if (msg.isNotBlank() && phase.value == JarvisPhase.IDLE) {
+                    _localStatusBanner.value = msg
                 }
             }
         }
@@ -367,22 +177,6 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
             phoneGranted = phone,
             contactsGranted = contacts
         )
-        if (mic) {
-            prewarmSpeechRecognizerIfPermitted()
-        }
-    }
-
-    private fun prewarmSpeechRecognizerIfPermitted() {
-        if (speechRecognizer != null) return
-        if (!SpeechRecognizer.isRecognitionAvailable(appContext)) return
-        val hasMic = ContextCompat.checkSelfPermission(appContext, Manifest.permission.RECORD_AUDIO) ==
-            PackageManager.PERMISSION_GRANTED
-        if (!hasMic) return
-        runCatching {
-            val sr = SpeechRecognizerFactory.createSafeRecognizer(appContext)
-            sr.setRecognitionListener(recognitionListener)
-            speechRecognizer = sr
-        }
     }
 
     private fun isAccessibilityServiceEnabled(): Boolean {
@@ -405,71 +199,53 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun toggleListening() {
-        if (_isLiveSessionActive.value || _phase.value == JarvisPhase.LISTENING || _phase.value == JarvisPhase.SPEAKING) {
+        if (isLiveSessionActive.value || phase.value == JarvisPhase.LISTENING || phase.value == JarvisPhase.SPEAKING) {
             stopLiveSessionManual()
         } else {
             startLiveSession()
         }
     }
 
-    fun startLiveSession() {
+    fun startLiveSession(initialCommand: String? = null) {
         refreshPermissions()
         if (!_permissionsState.value.microphoneGranted) {
-            _statusBanner.value = "Microphone permission required. Grant it in Systems."
+            _localStatusBanner.value = "Microphone permission required. Grant it in Systems."
             return
         }
-        if (!SpeechRecognizer.isRecognitionAvailable(appContext)) {
-            _statusBanner.value = "Speech recognition service unavailable on this device."
-            return
-        }
-
-        restartListeningJob?.cancel()
-        activeCommandJob?.cancel()
-        voiceEngine.stop()
-
-        _isAutoSleepStandby.value = false
-        _isLiveSessionActive.value = true
-        JarvisWakeWordService.isMainAppListening.value = true
-        lastSpeechDetectedTimestamp = SystemClock.elapsedRealtime()
-        _inactivityRemainingMs.value = INACTIVITY_TIMEOUT_MS
-        _statusBanner.value = "LIVE CONVERSATION ACTIVE"
-        _liveTranscript.value = "Listening continuously…"
-
-        startInactivityWatchdog()
-        beginRecognitionWindow(wakeWordOnly = false)
+        previewVoiceEngine.stop()
+        JarvisActiveAssistantService.startLiveSession(appContext, initialCommand)
     }
 
     fun stopLiveSessionManual() {
-        inactivityWatchdogJob?.cancel()
-        inactivityWatchdogJob = null
-        restartListeningJob?.cancel()
-        restartListeningJob = null
-        activeCommandJob?.cancel()
-        activeCommandJob = null
-        JarvisAccessibilityService.requestStopMultiStep()
+        previewVoiceEngine.stop()
+        JarvisActiveAssistantService.stopLiveSession(appContext)
+        _localStatusBanner.value = "STANDBY"
+    }
 
-        _isLiveSessionActive.value = false
-        JarvisWakeWordService.isMainAppListening.value = false
-        _isAutoSleepStandby.value = false
-        _inactivityRemainingMs.value = 0L
-        passiveWakeMode = false
-
-        stopSpeechRecognizerWindowOnly()
-        voiceEngine.stop()
-        _phase.value = JarvisPhase.IDLE
-        _statusBanner.value = "STANDBY"
+    fun stopSpeaking() {
+        previewVoiceEngine.stop()
+        if (isLiveSessionActive.value) {
+            JarvisActiveAssistantService.stopSpeech(appContext)
+        }
     }
 
     fun stopMultiStepAgent() {
         JarvisAccessibilityService.requestStopMultiStep()
         FloatingOrbService.hideStopHud(appContext)
-        _statusBanner.value = "Multi-step execution stopped"
+        _localStatusBanner.value = "Multi-step execution stopped"
+    }
+
+    fun submitCommand(commandText: String) {
+        val clean = commandText.trim()
+        if (clean.isEmpty()) return
+        previewVoiceEngine.stop()
+        JarvisActiveAssistantService.submitCommand(appContext, clean)
     }
 
     fun toggleAutoReplyMode(enabled: Boolean) {
         viewModelScope.launch {
             repository.updateAutoReplyConfig(enabled = enabled)
-            _statusBanner.value = if (enabled) {
+            _localStatusBanner.value = if (enabled) {
                 if (isNotificationListenerEnabled()) {
                     "AUTO-REPLY CHAT MODE ACTIVE"
                 } else {
@@ -500,7 +276,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
             )
             val id = repository.saveScheduledCall(entity)
             CallAlarmScheduler.scheduleCall(appContext, entity.copy(id = id))
-            _statusBanner.value = "Scheduled JARVIS call at ${CallAlarmScheduler.formatTime12Hour(hour, minute)}"
+            _localStatusBanner.value = "Scheduled JARVIS call at ${CallAlarmScheduler.formatTime12Hour(hour, minute)}"
         }
     }
 
@@ -520,7 +296,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             CallAlarmScheduler.cancelCall(appContext, call.id)
             repository.deleteScheduledCall(call)
-            _statusBanner.value = "Scheduled call removed"
+            _localStatusBanner.value = "Scheduled call removed"
         }
     }
 
@@ -537,12 +313,12 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             val service = JarvisAccessibilityService.instance
             if (service == null) {
-                _statusBanner.value = "Enable JARVIS Accessibility Service first"
+                _localStatusBanner.value = "Enable JARVIS Accessibility Service first"
                 onResult(false)
                 return@launch
             }
             val ok = service.performDiagnosticTestTap()
-            _statusBanner.value = if (ok) {
+            _localStatusBanner.value = if (ok) {
                 "Diagnostic tap succeeded — canPerformGestures ACTIVE"
             } else {
                 "Diagnostic tap failed — re-enable JARVIS Accessibility Service"
@@ -551,249 +327,10 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun startInactivityWatchdog() {
-        inactivityWatchdogJob?.cancel()
-        inactivityWatchdogJob = viewModelScope.launch {
-            while (isActive && _isLiveSessionActive.value) {
-                val elapsed = SystemClock.elapsedRealtime() - lastSpeechDetectedTimestamp
-                val remaining = (INACTIVITY_TIMEOUT_MS - elapsed).coerceAtLeast(0L)
-                _inactivityRemainingMs.value = remaining
-                if (elapsed >= INACTIVITY_TIMEOUT_MS) {
-                    triggerAutoSleep()
-                    break
-                }
-                delay(250L)
-            }
-        }
-    }
-
-    private fun triggerAutoSleep() {
-        inactivityWatchdogJob?.cancel()
-        inactivityWatchdogJob = null
-        restartListeningJob?.cancel()
-        restartListeningJob = null
-        activeCommandJob?.cancel()
-        activeCommandJob = null
-
-        stopSpeechRecognizerWindowOnly()
-        passiveWakeMode = false
-        _isLiveSessionActive.value = false
-        JarvisWakeWordService.isMainAppListening.value = false
-        _isAutoSleepStandby.value = true
-        _inactivityRemainingMs.value = 0L
-        _liveTranscript.value = ""
-        _phase.value = JarvisPhase.IDLE
-        _statusBanner.value = "STANDBY (AUTO-SLEEP)"
-
-        voiceEngine.speak(
-            text = "No voice detected for 3 minutes. JARVIS entering standby mode.",
-            settings = settings.value
-        ) {
-            _phase.value = JarvisPhase.IDLE
-        }
-    }
-
-    private fun isInactivityExpired(): Boolean {
-        return (SystemClock.elapsedRealtime() - lastSpeechDetectedTimestamp) >= INACTIVITY_TIMEOUT_MS
-    }
-
-    private fun markUserSpeechDetected() {
-        lastSpeechDetectedTimestamp = SystemClock.elapsedRealtime()
-        if (_isLiveSessionActive.value) {
-            _inactivityRemainingMs.value = INACTIVITY_TIMEOUT_MS
-        }
-    }
-
-    private fun scheduleLiveRestart(delayMs: Long) {
-        restartListeningJob?.cancel()
-        if (!_isLiveSessionActive.value) return
-        if (isInactivityExpired()) {
-            triggerAutoSleep()
-            return
-        }
-        restartListeningJob = viewModelScope.launch {
-            delay(delayMs)
-            if (!_isLiveSessionActive.value) return@launch
-            if (isInactivityExpired()) {
-                triggerAutoSleep()
-                return@launch
-            }
-            if (!voiceEngine.isSpeaking.value &&
-                _phase.value != JarvisPhase.THINKING &&
-                _phase.value != JarvisPhase.ACTING
-            ) {
-                beginRecognitionWindow(wakeWordOnly = false)
-            }
-        }
-    }
-
-    fun startVoiceListening(wakeWordOnly: Boolean = false) {
-        if (!wakeWordOnly) {
-            startLiveSession()
-        } else {
-            beginRecognitionWindow(wakeWordOnly = true)
-        }
-    }
-
-    private fun beginRecognitionWindow(wakeWordOnly: Boolean) {
-        refreshPermissions()
-        if (!_permissionsState.value.microphoneGranted) {
-            if (_isLiveSessionActive.value) stopLiveSessionManual()
-            _statusBanner.value = "Microphone permission required. Grant it in Systems."
-            return
-        }
-        if (!SpeechRecognizer.isRecognitionAvailable(appContext)) {
-            if (_isLiveSessionActive.value) stopLiveSessionManual()
-            _statusBanner.value = "Speech recognition service unavailable on this device."
-            return
-        }
-
-        stopSpeechRecognizerWindowOnly()
-        passiveWakeMode = wakeWordOnly
-        if (wakeWordOnly && !_isLiveSessionActive.value) {
-            val wake = settings.value.customWakeWord.ifBlank { "Jarvis" }
-            _liveTranscript.value = "Awaiting wake phrase \"$wake\"…"
-            _statusBanner.value = "Wake-word standby active"
-        } else if (_isLiveSessionActive.value) {
-            _statusBanner.value = "LIVE • Listening hands-free"
-        }
-        _phase.value = JarvisPhase.LISTENING
-
-        runCatching {
-            val recognizer = speechRecognizer ?: SpeechRecognizerFactory.createSafeRecognizer(appContext).also {
-                it.setRecognitionListener(recognitionListener)
-                speechRecognizer = it
-            }
-
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                putExtra(
-                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                    COMPLETE_SILENCE_MS
-                )
-                putExtra(
-                    RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                    POSSIBLY_COMPLETE_SILENCE_MS
-                )
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 400L)
-            }
-            isRecognizerListening = true
-            recognizer.startListening(intent)
-        }.onFailure { err ->
-            isRecognizerListening = false
-            destroySpeechRecognizer()
-            if (_isLiveSessionActive.value) {
-                scheduleLiveRestart(350L)
-            } else {
-                _phase.value = JarvisPhase.IDLE
-                _statusBanner.value = err.localizedMessage ?: "Failed to open microphone stream."
-            }
-        }
-    }
-
-    private fun stopSpeechRecognizerWindowOnly() {
-        _voiceRmsDb.value = 0f
-        if (isRecognizerListening) {
-            runCatching {
-                speechRecognizer?.stopListening()
-                speechRecognizer?.cancel()
-            }
-            isRecognizerListening = false
-        }
-    }
-
-    private fun destroySpeechRecognizer() {
-        _voiceRmsDb.value = 0f
-        isRecognizerListening = false
-        runCatching {
-            speechRecognizer?.stopListening()
-            speechRecognizer?.cancel()
-            speechRecognizer?.destroy()
-        }
-        speechRecognizer = null
-    }
-
-    fun stopListening() {
-        stopLiveSessionManual()
-    }
-
-    fun stopSpeaking() {
-        if (_isLiveSessionActive.value) {
-            stopLiveSessionManual()
-        } else {
-            voiceEngine.stop()
-            if (_phase.value == JarvisPhase.SPEAKING) {
-                _phase.value = JarvisPhase.IDLE
-            }
-        }
-    }
-
-    private fun handlePostSpeechTurnTaking() {
-        if (_isLiveSessionActive.value) {
-            if (isInactivityExpired()) {
-                triggerAutoSleep()
-            } else {
-                scheduleLiveRestart(POST_SPEECH_RESTART_DELAY_MS)
-            }
-        } else {
-            _phase.value = JarvisPhase.IDLE
-            JarvisWakeWordService.isMainAppListening.value = false
-            maybeResumeWakeWordLoop()
-        }
-    }
-
-    fun submitCommand(commandText: String) {
-        val clean = commandText.trim()
-        if (clean.isEmpty()) return
-
-        restartListeningJob?.cancel()
-        stopSpeechRecognizerWindowOnly()
-        _isAutoSleepStandby.value = false
-
-        activeCommandJob?.cancel()
-        activeCommandJob = viewModelScope.launch {
-            val currentSettings = repository.getSettings()
-            _liveTranscript.value = clean
-            _statusBanner.value = "Processing command…"
-            _phase.value = JarvisPhase.THINKING
-
-            val result = agentEngine.processCommand(
-                rawQuery = clean,
-                settings = currentSettings,
-                onPhaseUpdate = { updatedPhase -> _phase.value = updatedPhase },
-                onStatusUpdate = { status -> _statusBanner.value = status },
-                onStreamStart = {
-                    voiceEngine.beginStreamingSpeech(
-                        settings = currentSettings,
-                        onAllFinished = { handlePostSpeechTurnTaking() }
-                    )
-                },
-                onStreamSentence = { sentence ->
-                    voiceEngine.enqueueStreamSentence(sentence)
-                },
-                onStreamEnd = {
-                    voiceEngine.finishStreamingSpeech()
-                }
-            )
-
-            _statusBanner.value = "${result.executedAction} • ${result.latencyMs}ms"
-
-            if (!result.alreadyStreamSpoken) {
-                _phase.value = JarvisPhase.SPEAKING
-                voiceEngine.speak(result.reply, currentSettings) {
-                    handlePostSpeechTurnTaking()
-                }
-            }
-        }
-    }
-
     fun saveSettings(updated: SettingsEntity) {
         viewModelScope.launch {
             repository.saveSettings(updated)
-            _statusBanner.value = "JARVIS configuration saved locally"
+            _localStatusBanner.value = "JARVIS configuration saved locally"
 
             if (updated.floatingOverlayEnabled && Settings.canDrawOverlays(appContext)) {
                 FloatingOrbService.start(appContext)
@@ -811,16 +348,6 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
                 NetworkMonitorService.start(appContext)
             } else {
                 NetworkMonitorService.stop(appContext)
-            }
-
-            if (updated.wakeWordEnabled &&
-                !updated.alwaysOnWakeWordEnabled &&
-                _permissionsState.value.microphoneGranted &&
-                _phase.value == JarvisPhase.IDLE
-            ) {
-                startVoiceListening(wakeWordOnly = true)
-            } else if (!updated.wakeWordEnabled && passiveWakeMode) {
-                stopListening()
             }
         }
     }
@@ -844,7 +371,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun testVoice(previewSettings: SettingsEntity) {
-        voiceEngine.testVoice(previewSettings)
+        previewVoiceEngine.testVoice(previewSettings)
     }
 
     fun addCustomMacro(
@@ -863,7 +390,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
                     spokenReply = spokenReply.trim()
                 )
             )
-            _statusBanner.value = "Local macro \"$triggerPhrase\" stored"
+            _localStatusBanner.value = "Local macro \"$triggerPhrase\" stored"
         }
     }
 
@@ -876,18 +403,18 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     fun clearHistory() {
         viewModelScope.launch {
             repository.clearHistory()
-            _statusBanner.value = "Local telemetry logs cleared"
+            _localStatusBanner.value = "Local telemetry logs cleared"
         }
     }
 
     fun scanCurrentScreenNow() {
         val service = JarvisAccessibilityService.instance
         if (service == null) {
-            _statusBanner.value = "Enable JARVIS Accessibility Service to scan screens"
+            _localStatusBanner.value = "Enable JARVIS Accessibility Service to scan screens"
             return
         }
         val snapshot = service.readScreenHierarchy()
-        _statusBanner.value = snapshot?.let {
+        _localStatusBanner.value = snapshot?.let {
             "Scanned ${it.nodes.size} UI nodes in ${it.packageName}"
         } ?: "No active window nodes returned"
     }
@@ -896,10 +423,9 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         viewModelScope.launch {
             val service = JarvisAccessibilityService.instance
             if (service == null) {
-                _statusBanner.value = "Activate Accessibility Service to run gesture tests"
+                _localStatusBanner.value = "Activate Accessibility Service to run gesture tests"
                 return@launch
             }
-            _phase.value = JarvisPhase.ACTING
             val ok = when (gestureName) {
                 "SCROLL_DOWN" -> service.scrollDown()
                 "DRAG_DIAGONAL" -> service.gestureEngine.dragByAngle(angleDegrees = 315f, distancePx = 320f)
@@ -917,47 +443,12 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
                 }
                 else -> false
             }
-            _phase.value = JarvisPhase.IDLE
-            _statusBanner.value = if (ok) "Gesture $gestureName dispatched" else "Gesture $gestureName cancelled"
-        }
-    }
-
-    private fun maybeResumeWakeWordLoop() {
-        val current = settings.value
-        if (current.wakeWordEnabled &&
-            !current.alwaysOnWakeWordEnabled &&
-            !_isLiveSessionActive.value &&
-            _permissionsState.value.microphoneGranted &&
-            _phase.value == JarvisPhase.IDLE
-        ) {
-            viewModelScope.launch {
-                delay(700L)
-                if (settings.value.wakeWordEnabled &&
-                    !settings.value.alwaysOnWakeWordEnabled &&
-                    !_isLiveSessionActive.value &&
-                    _phase.value == JarvisPhase.IDLE
-                ) {
-                    beginRecognitionWindow(wakeWordOnly = true)
-                }
-            }
+            _localStatusBanner.value = if (ok) "Gesture $gestureName dispatched" else "Gesture $gestureName cancelled"
         }
     }
 
     override fun onCleared() {
         super.onCleared()
-        inactivityWatchdogJob?.cancel()
-        restartListeningJob?.cancel()
-        activeCommandJob?.cancel()
-        JarvisWakeWordService.isMainAppListening.value = false
-        destroySpeechRecognizer()
-        voiceEngine.shutdown()
-    }
-
-    companion object {
-        const val INACTIVITY_TIMEOUT_MS = 180_000L
-        const val POST_SPEECH_RESTART_DELAY_MS = 250L
-        const val SILENT_RESTART_DELAY_MS = 150L
-        const val COMPLETE_SILENCE_MS = 700L
-        const val POSSIBLY_COMPLETE_SILENCE_MS = 500L
+        previewVoiceEngine.shutdown()
     }
 }

@@ -4,7 +4,6 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
-import android.media.MediaPlayer
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -18,15 +17,19 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
 import java.util.Locale
 import java.util.UUID
 
 /**
- * Dual-Mode JARVIS Voice Synthesis Engine (Developed by Mozahid):
- * 1. "Normal Voice": Fast sentence-by-sentence streaming + Android Neural TextToSpeech.
- * 2. "With AI Voice": Native human-like AI audio output ("Charon" or "Fenrir") played via AudioTrack / MediaPlayer,
- *    with automatic seamless fallback to Normal Voice when offline.
+ * Dual-Mode JARVIS Voice Engine (Developed by Mozahid):
+ * 1. "Normal Voice": Fast sentence-by-sentence streaming + best available Neural Android TTS
+ *    (prioritizing en-IN / hi-IN / en-GB deep male pitch 0.92f).
+ * 2. "With AI Voice": Real-time Multimodal Live WebSocket streaming directly into Android AudioTrack
+ *    (24kHz PCM_16BIT MONO MODE_STREAM, selectable deep male voice "Charon" or "Fenrir") with
+ *    ~400ms start latency and automatic fallback to Normal Voice when offline or unavailable.
+ *
+ * Strictly sanitizes all text via JarvisResponseSanitizer before playback and coordinates with
+ * MicCoordinator so SpeechRecognizer NEVER listens while JARVIS is speaking.
  */
 class VoiceEngineManager(
     private val context: Context,
@@ -37,8 +40,8 @@ class VoiceEngineManager(
 
     private var tts: TextToSpeech? = null
     private var isTtsReady = false
-    private var mediaPlayer: MediaPlayer? = null
     private var audioTrack: AudioTrack? = null
+    private var audioTrackSampleRate: Int = 0
     private var aiVoiceJob: Job? = null
 
     @Volatile
@@ -68,6 +71,11 @@ class VoiceEngineManager(
 
     init {
         initializeSystemTts()
+    }
+
+    private fun setSpeakingState(speaking: Boolean) {
+        _isSpeaking.value = speaking
+        MicCoordinator.setJarvisSpeaking(speaking)
     }
 
     private fun initializeSystemTts() {
@@ -109,8 +117,8 @@ class VoiceEngineManager(
         }
 
         if (voices.isEmpty()) {
-            engine.language = Locale.UK
-            _activeVoiceLabel.value = "Neural English (UK)"
+            engine.language = Locale("en", "IN")
+            _activeVoiceLabel.value = "Neural English (India)"
             return
         }
 
@@ -128,8 +136,8 @@ class VoiceEngineManager(
             }
             _activeVoiceLabel.value = "${best.locale.displayName} ($qualityTag)"
         } else {
-            engine.language = Locale.UK
-            _activeVoiceLabel.value = "Neural English (UK)"
+            engine.language = Locale("en", "IN")
+            _activeVoiceLabel.value = "Neural English (India)"
         }
     }
 
@@ -139,31 +147,30 @@ class VoiceEngineManager(
         val lang = voice.locale.language.lowercase(Locale.ROOT)
         val country = voice.locale.country.uppercase(Locale.ROOT)
 
-        if (lang == "en") score += 400
-        when (country) {
-            "GB" -> score += 160
-            "US" -> score += 120
-            "IN" -> score += 90
-            "AU" -> score += 80
-        }
+        // Prioritize en-IN & hi-IN neural voices for natural Hinglish/English clarity, followed by en-GB / en-US
+        if (lang == "en" && country == "IN") score += 520
+        else if (lang == "hi" && country == "IN") score += 480
+        else if (lang == "en" && country == "GB") score += 460
+        else if (lang == "en" && country == "US") score += 430
+        else if (lang == "en") score += 380
 
         score += when {
-            voice.quality >= Voice.QUALITY_VERY_HIGH -> 300
-            voice.quality >= Voice.QUALITY_HIGH -> 200
+            voice.quality >= Voice.QUALITY_VERY_HIGH -> 320
+            voice.quality >= Voice.QUALITY_HIGH -> 220
             voice.quality >= Voice.QUALITY_NORMAL -> 80
             else -> 10
         }
 
-        if (!voice.isNetworkConnectionRequired) score += 60
+        if (!voice.isNetworkConnectionRequired) score += 70
 
-        val preferredTokens = listOf(
-            "gbd", "rjs", "fis", "tpd", "iom", "iol", "sfg",
+        val preferredMaleNeuralTokens = listOf(
+            "ene", "end", "hid", "gbd", "rjs", "fis", "tpd", "iom", "iol", "sfg",
             "male", "neural", "wavenet", "enhanced", "network", "local"
         )
-        for (token in preferredTokens) {
+        for (token in preferredMaleNeuralTokens) {
             if (name.contains(token)) score += 35
         }
-        if (name.contains("espeak") || name.contains("pico")) score -= 200
+        if (name.contains("espeak") || name.contains("pico")) score -= 220
 
         return score
     }
@@ -173,7 +180,7 @@ class VoiceEngineManager(
             override fun onStart(utteranceId: String?) {
                 if (utteranceId == "jarvis_prewarm") return
                 if (utteranceId == activeUtteranceId || isStreamingSessionOpen) {
-                    _isSpeaking.value = true
+                    setSpeakingState(true)
                 }
             }
 
@@ -195,7 +202,7 @@ class VoiceEngineManager(
 
             override fun onStop(utteranceId: String?, interrupted: Boolean) {
                 if (utteranceId == activeUtteranceId) {
-                    _isSpeaking.value = false
+                    setSpeakingState(false)
                 }
             }
         })
@@ -221,7 +228,7 @@ class VoiceEngineManager(
         activeUtteranceId = null
         activeStreamSettings = null
         aiVoiceStreamBuffer.clear()
-        _isSpeaking.value = false
+        setSpeakingState(false)
         val cb = onSpeechFinishedCallback
         onSpeechFinishedCallback = null
         cb?.invoke()
@@ -233,7 +240,7 @@ class VoiceEngineManager(
                 return@launch
             }
             activeUtteranceId = null
-            _isSpeaking.value = false
+            setSpeakingState(false)
             val cb = onSpeechFinishedCallback
             onSpeechFinishedCallback = null
             cb?.invoke()
@@ -244,10 +251,16 @@ class VoiceEngineManager(
         return settings.voiceMode == VOICE_MODE_AI_VOICE && settings.geminiApiKey.isNotBlank()
     }
 
+    private fun effectiveNormalPitch(settings: SettingsEntity): Float {
+        // Default deep male JARVIS pitch 0.92f if unchanged from legacy default
+        val raw = settings.voicePitch
+        return if (raw <= 0.0f) DEFAULT_DEEP_MALE_PITCH else raw.coerceIn(0.60f, 1.40f)
+    }
+
     /**
      * Begins a zero-lag sentence-by-sentence streaming speech session.
-     * In "Normal Voice" mode, sentences speak immediately via TextToSpeech.QUEUE_ADD (~400ms start).
-     * In "With AI Voice" mode, accumulates streamed sentences cleanly and renders native AI audio.
+     * In "Normal Voice" mode, sanitized sentences speak immediately via TextToSpeech.QUEUE_ADD (~400ms start).
+     * In "With AI Voice" mode, buffers the clean response and streams 24kHz PCM via Live WebSocket.
      */
     fun beginStreamingSpeech(
         settings: SettingsEntity,
@@ -261,10 +274,11 @@ class VoiceEngineManager(
         streamSentencesQueuedCount = 0
         streamLastUtteranceId = null
         aiVoiceStreamBuffer.clear()
+        setSpeakingState(true)
     }
 
     fun enqueueStreamSentence(sentence: String) {
-        val clean = sentence.trim()
+        val clean = JarvisResponseSanitizer.sanitizePlainSpeechText(sentence)
         val settings = activeStreamSettings ?: return
         if (clean.isEmpty() || !isStreamingSessionOpen) return
 
@@ -279,8 +293,8 @@ class VoiceEngineManager(
 
         val isFirst = streamSentencesQueuedCount == 0
         if (isFirst) {
-            engine.setPitch(settings.voicePitch.coerceIn(0.55f, 1.5f))
-            engine.setSpeechRate(settings.voiceSpeed.coerceIn(0.6f, 1.75f))
+            engine.setPitch(effectiveNormalPitch(settings))
+            engine.setSpeechRate(settings.voiceSpeed.coerceIn(0.65f, 1.75f))
             _lastVoiceStatus.value = "Normal Voice active (${_activeVoiceLabel.value})"
         }
 
@@ -292,7 +306,7 @@ class VoiceEngineManager(
         streamSentencesQueuedCount++
         streamLastUtteranceId = utteranceId
         activeUtteranceId = utteranceId
-        _isSpeaking.value = true
+        setSpeakingState(true)
 
         val status = engine.speak(clean, queueMode, params, utteranceId)
         if (status == TextToSpeech.ERROR) {
@@ -306,7 +320,7 @@ class VoiceEngineManager(
             val settings = activeStreamSettings
 
             if (settings != null && isAiVoiceMode(settings) && aiVoiceStreamBuffer.isNotEmpty()) {
-                val fullText = aiVoiceStreamBuffer.toString().trim()
+                val fullText = JarvisResponseSanitizer.extractCleanReply(aiVoiceStreamBuffer.toString())
                 val cb = onSpeechFinishedCallback
                 isStreamingSessionOpen = false
                 streamInputFinished = false
@@ -333,8 +347,9 @@ class VoiceEngineManager(
         settings: SettingsEntity,
         onComplete: (() -> Unit)? = null
     ) {
-        val cleanText = text.trim()
+        val cleanText = JarvisResponseSanitizer.extractCleanReply(text)
         if (cleanText.isEmpty()) {
+            setSpeakingState(false)
             onComplete?.invoke()
             return
         }
@@ -343,170 +358,141 @@ class VoiceEngineManager(
         onSpeechFinishedCallback = onComplete
 
         if (isAiVoiceMode(settings)) {
-            _isSpeaking.value = true
-            _lastVoiceStatus.value = "With AI Voice active (${settings.aiVoiceName})"
+            setSpeakingState(true)
+            val chosenVoice = settings.aiVoiceName.ifBlank { AI_VOICE_CHARON }
+            _lastVoiceStatus.value = "With AI Voice streaming ($chosenVoice)"
             aiVoiceJob = scope.launch {
-                val played = trySpeakNativeAiVoice(cleanText, settings)
-                if (!played) {
-                    _lastVoiceStatus.value = "With AI Voice offline — switched to Normal Voice"
-                    speakWithSystemTts(cleanText, settings.voicePitch, settings.voiceSpeed)
+                val streamedOk = streamLiveAiVoiceToAudioTrack(cleanText, settings)
+                if (!streamedOk) {
+                    _lastVoiceStatus.value = "AI Voice unavailable — using Neural Normal Voice"
+                    speakWithSystemTts(cleanText, effectiveNormalPitch(settings), settings.voiceSpeed)
                 }
             }
         } else {
             _lastVoiceStatus.value = "Normal Voice active (${_activeVoiceLabel.value})"
-            speakWithSystemTts(cleanText, settings.voicePitch, settings.voiceSpeed)
+            speakWithSystemTts(cleanText, effectiveNormalPitch(settings), settings.voiceSpeed)
         }
     }
 
     fun testVoice(settings: SettingsEntity) {
-        val sample = "All systems operational, sir. JARVIS, developed by Mozahid, is online and at your command."
+        val sample = "All systems operational, sir. JARVIS, developed by Mozahid, is online and ready for your command."
         speak(sample, settings)
     }
 
     private fun speakWithSystemTts(text: String, pitch: Float, speed: Float) {
+        val sanitized = JarvisResponseSanitizer.sanitizePlainSpeechText(text)
         val engine = tts
-        if (engine == null || !isTtsReady) {
+        if (sanitized.isEmpty() || engine == null || !isTtsReady) {
             dispatchSpeechFinished(expectedUtteranceId = null)
             return
         }
-        engine.setPitch(pitch.coerceIn(0.55f, 1.5f))
-        engine.setSpeechRate(speed.coerceIn(0.6f, 1.75f))
+        engine.setPitch(pitch.coerceIn(0.60f, 1.40f))
+        engine.setSpeechRate(speed.coerceIn(0.65f, 1.75f))
         val params = Bundle().apply {
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
         }
         val utteranceId = "jarvis_${UUID.randomUUID()}"
         activeUtteranceId = utteranceId
-        _isSpeaking.value = true
-        val status = engine.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        setSpeakingState(true)
+        val status = engine.speak(sanitized, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
         if (status == TextToSpeech.ERROR) {
             dispatchSpeechFinished(expectedUtteranceId = utteranceId)
         }
     }
 
-    private suspend fun trySpeakNativeAiVoice(text: String, settings: SettingsEntity): Boolean {
-        val audioResult = aiClient.requestAiVoiceAudio(
+    /**
+     * Streams 24kHz 16-bit mono PCM chunks from Multimodal Live WebSocket directly into AudioTrack
+     * as each chunk arrives for ultra-low-latency (~400ms) realistic male AI speech.
+     */
+    private suspend fun streamLiveAiVoiceToAudioTrack(
+        cleanText: String,
+        settings: SettingsEntity
+    ): Boolean = withContext(Dispatchers.IO) {
+        releaseAudioTrack()
+        var wroteAnyAudio = false
+        val trackLock = Any()
+
+        val result = aiClient.streamLiveAiVoice(
             rawApiKey = settings.geminiApiKey,
-            textToSpeak = text,
-            voiceName = settings.aiVoiceName
-        )
-        val payload = audioResult.getOrNull() ?: return false
-        val mime = payload.mimeType.lowercase(Locale.ROOT)
-
-        return if (mime.contains("l16") || mime.contains("pcm")) {
-            val sampleRate = parsePcmSampleRate(mime)
-            playPcmWithAudioTrack(payload.audioBytes, sampleRate)
-        } else {
-            playEncodedAudioWithMediaPlayer(payload.audioBytes)
-        }
-    }
-
-    private fun parsePcmSampleRate(mimeType: String): Int {
-        val match = Regex("rate=(\\d+)").find(mimeType)
-        return match?.groupValues?.getOrNull(1)?.toIntOrNull()?.coerceIn(8000, 48000) ?: 24000
-    }
-
-    private suspend fun playPcmWithAudioTrack(pcmBytes: ByteArray, sampleRateHz: Int): Boolean {
-        return withContext(Dispatchers.IO) {
-            try {
-                releaseAudioOutputs()
-                val minBuf = AudioTrack.getMinBufferSize(
-                    sampleRateHz,
-                    AudioFormat.CHANNEL_OUT_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                ).coerceAtLeast(4096)
-
-                val track = AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build()
-                    )
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(sampleRateHz)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(maxOf(minBuf, pcmBytes.size.coerceAtMost(131_072)))
-                    .setTransferMode(AudioTrack.MODE_STREAM)
-                    .build()
-
-                audioTrack = track
-                _isSpeaking.value = true
-                track.play()
-
-                var offset = 0
-                val chunkSize = 4096
-                while (offset < pcmBytes.size && audioTrack === track) {
-                    val toWrite = minOf(chunkSize, pcmBytes.size - offset)
-                    val written = track.write(pcmBytes, offset, toWrite)
-                    if (written <= 0) break
-                    offset += written
+            textToSpeak = cleanText,
+            voiceName = settings.aiVoiceName.ifBlank { AI_VOICE_CHARON },
+            onPcmChunk = { pcmBytes, sampleRateHz ->
+                synchronized(trackLock) {
+                    val track = ensureStreamingAudioTrack(sampleRateHz) ?: return@synchronized
+                    var offset = 0
+                    while (offset < pcmBytes.size && audioTrack === track) {
+                        val toWrite = minOf(4096, pcmBytes.size - offset)
+                        val written = runCatching {
+                            track.write(pcmBytes, offset, toWrite, AudioTrack.WRITE_BLOCKING)
+                        }.getOrDefault(-1)
+                        if (written <= 0) break
+                        offset += written
+                        wroteAnyAudio = true
+                    }
                 }
+            }
+        )
 
+        synchronized(trackLock) {
+            audioTrack?.let { track ->
                 runCatching {
+                    // Drain remaining buffered audio before releasing
                     track.stop()
                     track.release()
                 }
-                if (audioTrack === track) {
-                    audioTrack = null
-                }
-                dispatchSpeechFinished(expectedUtteranceId = null)
-                true
-            } catch (_: Exception) {
-                releaseAudioOutputs()
-                false
+                audioTrack = null
+                audioTrackSampleRate = 0
             }
+        }
+
+        if (result.isSuccess && wroteAnyAudio) {
+            dispatchSpeechFinished(expectedUtteranceId = null)
+            true
+        } else {
+            false
         }
     }
 
-    private fun playEncodedAudioWithMediaPlayer(bytes: ByteArray): Boolean {
-        return try {
-            releaseAudioOutputs()
-            val outFile = File(context.cacheDir, "jarvis_ai_voice.audio")
-            outFile.writeBytes(bytes)
+    private fun ensureStreamingAudioTrack(sampleRateHz: Int): AudioTrack? {
+        val existing = audioTrack
+        if (existing != null && audioTrackSampleRate == sampleRateHz) {
+            return existing
+        }
+        releaseAudioTrack()
 
-            val player = MediaPlayer().apply {
-                setAudioAttributes(
+        return runCatching {
+            val minBuf = AudioTrack.getMinBufferSize(
+                sampleRateHz,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(8192)
+
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_ASSISTANT)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
-                setDataSource(outFile.absolutePath)
-                setOnCompletionListener {
-                    releaseAudioOutputs()
-                    dispatchSpeechFinished(expectedUtteranceId = null)
-                }
-                setOnErrorListener { _, _, _ ->
-                    releaseAudioOutputs()
-                    dispatchSpeechFinished(expectedUtteranceId = null)
-                    true
-                }
-                prepare()
-                start()
-            }
-            mediaPlayer = player
-            activeUtteranceId = null
-            _isSpeaking.value = true
-            true
-        } catch (_: Exception) {
-            releaseAudioOutputs()
-            false
-        }
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRateHz)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBuf * 2)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+
+            track.play()
+            audioTrack = track
+            audioTrackSampleRate = sampleRateHz
+            track
+        }.getOrNull()
     }
 
-    private fun releaseAudioOutputs() {
-        mediaPlayer?.let { player ->
-            runCatching {
-                if (player.isPlaying) player.stop()
-                player.release()
-            }
-        }
-        mediaPlayer = null
-
+    private fun releaseAudioTrack() {
         audioTrack?.let { track ->
             runCatching {
                 track.pause()
@@ -516,11 +502,13 @@ class VoiceEngineManager(
             }
         }
         audioTrack = null
+        audioTrackSampleRate = 0
     }
 
     fun stop() {
         aiVoiceJob?.cancel()
         aiVoiceJob = null
+        aiClient.cancelActiveVoiceStream()
         isStreamingSessionOpen = false
         streamInputFinished = false
         streamSentencesQueuedCount = 0
@@ -530,8 +518,8 @@ class VoiceEngineManager(
         activeUtteranceId = null
         onSpeechFinishedCallback = null
         tts?.stop()
-        releaseAudioOutputs()
-        _isSpeaking.value = false
+        releaseAudioTrack()
+        setSpeakingState(false)
     }
 
     fun shutdown() {
@@ -539,5 +527,9 @@ class VoiceEngineManager(
         tts?.shutdown()
         tts = null
         isTtsReady = false
+    }
+
+    companion object {
+        const val DEFAULT_DEEP_MALE_PITCH = 0.92f
     }
 }

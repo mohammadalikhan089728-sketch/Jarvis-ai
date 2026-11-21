@@ -37,7 +37,11 @@ import java.util.Locale
 /**
  * Always-On Background Wake Word Foreground Service for JARVIS (Developed by Mozahid).
  * Stays alive via START_STICKY, foregroundServiceType="microphone", onTaskRemoved self-restart,
- * and BootReceiver even when the user swipes JARVIS away from recent tasks.
+ * and BootReceiver even when JARVIS is closed from recents.
+ *
+ * Strictly governed by MicCoordinator: automatically yields and pauses whenever MainActivity,
+ * JarvisActiveAssistantService, JarvisIncomingCallActivity, or JARVIS TTS is active so two
+ * SpeechRecognizers NEVER fight over the microphone.
  */
 class JarvisWakeWordService : Service() {
 
@@ -45,8 +49,10 @@ class JarvisWakeWordService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private var speechRecognizer: SpeechRecognizer? = null
     private var isCycleListening = false
+
     @Volatile
     private var activeWakeWord: String = "Jarvis"
+
     @Volatile
     private var wakeEnabledInDb: Boolean = true
     private var lastTriggerElapsedMs: Long = 0L
@@ -55,11 +61,21 @@ class JarvisWakeWordService : Service() {
         startNextWakeCycle()
     }
 
+    private val pauseFromCoordinator: () -> Unit = {
+        mainHandler.removeCallbacks(restartCycleRunnable)
+        stopRecognizerCleanly()
+        MicCoordinator.release(MicOwner.WAKE_WORD)
+        // Re-check later once foreground/active assistant/call finishes
+        scheduleNextCycle(1_500L)
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        MicCoordinator.registerWakeWordPauseListener(pauseFromCoordinator)
+        MicCoordinator.registerSpeechPauseListener(pauseFromCoordinator)
         observeSettingsInBackground()
     }
 
@@ -94,7 +110,7 @@ class JarvisWakeWordService : Service() {
         }
 
         _isRunning.value = true
-        scheduleNextCycle(350L)
+        scheduleNextCycle(500L)
         return START_STICKY
     }
 
@@ -124,9 +140,13 @@ class JarvisWakeWordService : Service() {
     private fun startNextWakeCycle() {
         if (!wakeEnabledInDb) return
 
-        // Yield microphone whenever MainActivity live listening or an incoming JARVIS call is active
-        if (isMainAppListening.value || JarvisIncomingCallActivity.isCallActive.value) {
+        // Strictly yield microphone whenever MainActivity, ActiveAssistantService, IncomingCall, or TTS is active
+        if (MicCoordinator.shouldPauseWakeWord() ||
+            isMainAppListening.value ||
+            JarvisIncomingCallActivity.isCallActive.value
+        ) {
             stopRecognizerCleanly()
+            MicCoordinator.release(MicOwner.WAKE_WORD)
             scheduleNextCycle(1_500L)
             return
         }
@@ -154,10 +174,20 @@ class JarvisWakeWordService : Service() {
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
             }
-            isCycleListening = true
-            recognizer.startListening(intent)
+
+            val started = MicCoordinator.startListeningSilently(
+                context = this,
+                owner = MicOwner.WAKE_WORD,
+                recognizer = recognizer,
+                intent = intent
+            )
+            isCycleListening = started
+            if (!started) {
+                scheduleNextCycle(1_200L)
+            }
         }.onFailure {
             destroyRecognizerCleanly()
+            MicCoordinator.release(MicOwner.WAKE_WORD)
             scheduleNextCycle(2_000L)
         }
     }
@@ -174,14 +204,17 @@ class JarvisWakeWordService : Service() {
 
         override fun onError(error: Int) {
             isCycleListening = false
+            MicCoordinator.release(MicOwner.WAKE_WORD)
+
             if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
                 destroyRecognizerCleanly()
             } else {
                 stopRecognizerCleanly()
             }
+
             val backoff = when (error) {
                 SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 700L
+                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> MicCoordinator.ERROR_RESTART_DEBOUNCE_MS
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> 10_000L
                 else -> 1_600L
             }
@@ -190,6 +223,8 @@ class JarvisWakeWordService : Service() {
 
         override fun onResults(results: Bundle?) {
             isCycleListening = false
+            MicCoordinator.release(MicOwner.WAKE_WORD)
+
             val text = results
                 ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 ?.firstOrNull()
@@ -198,7 +233,7 @@ class JarvisWakeWordService : Service() {
             if (text.isNotEmpty() && matchesWakeWord(text)) {
                 handleWakeWordTriggered(text)
             } else {
-                scheduleNextCycle(700L)
+                scheduleNextCycle(MicCoordinator.ERROR_RESTART_DEBOUNCE_MS)
             }
         }
 
@@ -227,7 +262,9 @@ class JarvisWakeWordService : Service() {
         if ((now - lastTriggerElapsedMs) < 3_000L) return
         lastTriggerElapsedMs = now
 
+        mainHandler.removeCallbacks(restartCycleRunnable)
         stopRecognizerCleanly()
+        MicCoordinator.release(MicOwner.WAKE_WORD)
         playActivationTone()
 
         // Extract optional command spoken right after the wake word
@@ -236,6 +273,12 @@ class JarvisWakeWordService : Service() {
         val trailingCommand = if (idx >= 0) {
             transcript.substring(idx + target.length).trim().trimStart(',', ':', ' ')
         } else ""
+
+        // Start persistent foreground live assistant directly so it works even over Home/other apps
+        JarvisActiveAssistantService.startLiveSession(
+            context = applicationContext,
+            initialCommand = trailingCommand.takeIf { it.length >= 3 }
+        )
 
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             action = Intent.ACTION_ASSIST
@@ -252,7 +295,7 @@ class JarvisWakeWordService : Service() {
         }
         runCatching { startActivity(launchIntent) }
 
-        // Wait before resuming background wake cycles while MainActivity handles live conversation
+        // Pause wake loop while Active Assistant handles continuous session
         scheduleNextCycle(3_000L)
     }
 
@@ -285,7 +328,6 @@ class JarvisWakeWordService : Service() {
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
         if (!wakeEnabledInDb) return
-        // Schedule automatic service restart if user swipes the app away from recents
         runCatching {
             val restartIntent = Intent(applicationContext, JarvisWakeWordService::class.java)
             val pi = PendingIntent.getService(
@@ -305,8 +347,11 @@ class JarvisWakeWordService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        MicCoordinator.unregisterWakeWordPauseListener(pauseFromCoordinator)
+        MicCoordinator.unregisterSpeechPauseListener(pauseFromCoordinator)
         mainHandler.removeCallbacks(restartCycleRunnable)
         destroyRecognizerCleanly()
+        MicCoordinator.release(MicOwner.WAKE_WORD)
         serviceScope.cancel()
         _isRunning.value = false
     }
@@ -357,7 +402,7 @@ class JarvisWakeWordService : Service() {
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
 
-        // Updated by JarvisViewModel so WakeWordService yields mic cleanly during active live sessions
+        // Retained for backward compatibility alongside MicCoordinator
         val isMainAppListening = MutableStateFlow(false)
 
         fun start(context: Context) {

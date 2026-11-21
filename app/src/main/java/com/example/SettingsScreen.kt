@@ -467,7 +467,7 @@ fun SettingsScreen(
                 Spacer(modifier = Modifier.height(14.dp))
 
                 Text(
-                    text = String.format(Locale.US, "VOICE PITCH: %.2fx (Default 0.88x)", voicePitch),
+                    text = String.format(Locale.US, "VOICE PITCH: %.2fx (Default 0.92x)", voicePitch),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -523,7 +523,7 @@ fun SettingsScreen(
                     }
                     OutlinedButton(
                         onClick = {
-                            voicePitch = 0.88f
+                            voicePitch = 0.92f
                             voiceSpeed = 1.02f
                         },
                         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)

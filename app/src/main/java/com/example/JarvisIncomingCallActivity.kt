@@ -37,10 +37,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -93,8 +93,8 @@ private enum class CallStage {
 
 /**
  * Full-Screen Futuristic Incoming Call & Live Two-Way Conversation Activity for JARVIS (Developed by Mozahid).
- * Wakes the screen over the lock screen, plays device ringtone + vibration, and conducts intelligent
- * hands-free conversations for Wake-Up/Study Coaching, Smart Views Checks, and Viral/Online Alerts.
+ * Coordinates microphone access exclusively through MicCoordinator, sanitizes every AI reply so raw
+ * JSON/brackets are never shown or spoken, and supports both Normal Voice and Multimodal Live AI Voice.
  */
 class JarvisIncomingCallActivity : ComponentActivity() {
 
@@ -125,12 +125,18 @@ class JarvisIncomingCallActivity : ComponentActivity() {
     private val _userTranscript = MutableStateFlow("")
     private val _statusLine = MutableStateFlow("INCOMING CALL")
 
+    private val pauseOnSpeechListener: () -> Unit = {
+        stopRecognizerCleanly()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         configureLockScreenWake()
         enableEdgeToEdge()
 
         _isCallActive.value = true
+        MicCoordinator.setIncomingCallActive(true)
+        MicCoordinator.registerSpeechPauseListener(pauseOnSpeechListener)
         CallAlarmReceiver.dismissCallNotification(this)
 
         repository = JarvisRepository(JarvisDatabase.getInstance(applicationContext))
@@ -278,7 +284,7 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                 Scheduled Purpose: "$callPurpose".
                 Greet them warmly and energetically in natural Hinglish/Hindi.
                 Ask an interactive wake-up check question like: "Good morning Sir! Aankh khuli Sir? Aaj kaunsa subject padhna hai?"
-                Keep it crisp (2 short sentences).
+                Keep it crisp (2 short sentences). Respond in plain spoken sentences only (no JSON).
             """.trimIndent()
 
             CALL_TYPE_SMART_VIEWS_CHECK -> """
@@ -287,21 +293,21 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                 Local Notification Milestones Observed: $alertsText.
                 First briefly report any milestones observed (or mention no big alert came yet), then politely ask permission:
                 "Sir, kya main abhi ek baar Instagram ya YouTube khol kar fresh views check kar du?"
-                Keep it concise (2 short sentences).
+                Keep it concise (2 short sentences). Respond in plain spoken sentences only (no JSON).
             """.trimIndent()
 
             CALL_TYPE_ONLINE_ALERT -> """
                 You just called the user because the phone came online with important/viral alerts!
                 Alert Details: $alertsText.
                 Brief the user clearly and enthusiastically in natural Hinglish/English and ask if they want to take action.
-                Keep it concise (2 short sentences).
+                Keep it concise (2 short sentences). Respond in plain spoken sentences only (no JSON).
             """.trimIndent()
 
             else -> """
                 You just called the user for a scheduled JARVIS call.
                 Scheduled Purpose: "$callPurpose".
                 Greet them respectfully as JARVIS and remind them clearly about the purpose, then ask how they would like to proceed.
-                Keep it concise (2 short sentences).
+                Keep it concise (2 short sentences). Respond in plain spoken sentences only (no JSON).
             """.trimIndent()
         }
     }
@@ -313,6 +319,7 @@ class JarvisIncomingCallActivity : ComponentActivity() {
     ) {
         if (_stage.value != CallStage.ACTIVE_CONVERSATION) return
         stopRecognizerCleanly()
+        MicCoordinator.release(MicOwner.INCOMING_CALL)
         _statusLine.value = "JARVIS THINKING…"
 
         if (settings.geminiApiKey.isBlank()) {
@@ -326,10 +333,11 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                 else ->
                     "Hello Sir, JARVIS calling for: $callPurpose."
             }
-            _jarvisSpeechText.value = offlineFallback
+            val cleanOffline = JarvisResponseSanitizer.extractCleanReply(offlineFallback)
+            _jarvisSpeechText.value = cleanOffline
             _statusLine.value = "JARVIS SPEAKING…"
-            voiceEngine.speak(offlineFallback, settings) {
-                scheduleCallListeningRestart(250L)
+            voiceEngine.speak(cleanOffline, settings) {
+                scheduleCallListeningRestart(MicCoordinator.POST_SPEECH_RESTART_DELAY_MS)
             }
             return
         }
@@ -354,18 +362,20 @@ class JarvisIncomingCallActivity : ComponentActivity() {
             recentHistory = callDialogueLog.takeLast(6),
             extraSystemGuidance = callGuidance,
             onSentenceReady = { sentence ->
+                val cleanSentence = JarvisResponseSanitizer.sanitizePlainSpeechText(sentence)
+                if (cleanSentence.isEmpty()) return@streamConversationalReply
                 if (collectedReply.isNotEmpty()) collectedReply.append(' ')
-                collectedReply.append(sentence)
+                collectedReply.append(cleanSentence)
                 _jarvisSpeechText.value = collectedReply.toString()
                 if (useNormalStreaming) {
                     if (!streamingStarted) {
                         streamingStarted = true
                         _statusLine.value = "JARVIS SPEAKING…"
                         voiceEngine.beginStreamingSpeech(settings) {
-                            scheduleCallListeningRestart(250L)
+                            scheduleCallListeningRestart(MicCoordinator.POST_SPEECH_RESTART_DELAY_MS)
                         }
                     }
-                    voiceEngine.enqueueStreamSentence(sentence)
+                    voiceEngine.enqueueStreamSentence(cleanSentence)
                 }
             }
         )
@@ -374,9 +384,9 @@ class JarvisIncomingCallActivity : ComponentActivity() {
             voiceEngine.finishStreamingSpeech()
         }
 
-        val finalSpoken = result.getOrElse {
-            "Sir, I am on the line regarding $callPurpose."
-        }
+        val finalSpoken = JarvisResponseSanitizer.extractCleanReply(
+            result.getOrElse { "Sir, I am on the line regarding $callPurpose." }
+        ).ifBlank { "Sir, I am on the line regarding $callPurpose." }
         _jarvisSpeechText.value = finalSpoken
 
         if (!isOpeningTurn) {
@@ -395,7 +405,7 @@ class JarvisIncomingCallActivity : ComponentActivity() {
         if (!streamingStarted) {
             _statusLine.value = "JARVIS SPEAKING…"
             voiceEngine.speak(finalSpoken, settings) {
-                scheduleCallListeningRestart(250L)
+                scheduleCallListeningRestart(MicCoordinator.POST_SPEECH_RESTART_DELAY_MS)
             }
         }
     }
@@ -410,8 +420,9 @@ class JarvisIncomingCallActivity : ComponentActivity() {
             turnJob?.cancel()
             turnJob = lifecycleScope.launch {
                 val settings = repository.getSettings()
-                _jarvisSpeechText.value = "Alright Sir, ending the call. Have a productive session!"
-                voiceEngine.speak("Alright Sir, ending the call. Have a productive session!", settings) {
+                val bye = "Alright Sir, ending the call. Have a productive session!"
+                _jarvisSpeechText.value = bye
+                voiceEngine.speak(bye, settings) {
                     declineOrEndCall()
                 }
             }
@@ -439,7 +450,7 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                     ?.toPlainReadableText()
                     ?: "Accessibility screen reader is inactive, so I opened $targetApp for you to view directly."
 
-                val summaryPrompt = "The user said yes to checking $targetApp views once. Summarize any visible view/like/subscriber numbers from this screen text clearly in 2 short sentences:\n$screenText"
+                val summaryPrompt = "The user said yes to checking $targetApp views once. Summarize any visible view/like/subscriber numbers from this screen text clearly in 2 short spoken sentences:\n$screenText"
                 speakCallTurn(summaryPrompt, settings)
             }
             return
@@ -474,6 +485,10 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                 declineOrEndCall()
                 return@launch
             }
+            if (MicCoordinator.isJarvisSpeaking.value) {
+                scheduleCallListeningRestart(MicCoordinator.ERROR_RESTART_DEBOUNCE_MS)
+                return@launch
+            }
             startCallListeningWindow()
         }
     }
@@ -485,6 +500,11 @@ class JarvisIncomingCallActivity : ComponentActivity() {
             _statusLine.value = "MICROPHONE PERMISSION NEEDED"
             return
         }
+        if (MicCoordinator.isJarvisSpeaking.value) {
+            scheduleCallListeningRestart(MicCoordinator.ERROR_RESTART_DEBOUNCE_MS)
+            return
+        }
+
         stopRecognizerCleanly()
         _statusLine.value = "LISTENING • SPEAK NATURALLY"
 
@@ -501,9 +521,18 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
                 putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 500L)
             }
-            recognizer.startListening(intent)
+            val started = MicCoordinator.startListeningSilently(
+                context = this,
+                owner = MicOwner.INCOMING_CALL,
+                recognizer = recognizer,
+                intent = intent
+            )
+            if (!started) {
+                scheduleCallListeningRestart(MicCoordinator.ERROR_RESTART_DEBOUNCE_MS)
+            }
         }.onFailure {
             destroyRecognizerCleanly()
+            MicCoordinator.release(MicOwner.INCOMING_CALL)
             scheduleCallListeningRestart(500L)
         }
     }
@@ -514,28 +543,31 @@ class JarvisIncomingCallActivity : ComponentActivity() {
             lastSpeechElapsedMs = SystemClock.elapsedRealtime()
             _statusLine.value = "HEARING YOU…"
         }
+
         override fun onRmsChanged(rmsdB: Float) = Unit
         override fun onBufferReceived(buffer: ByteArray?) = Unit
         override fun onEndOfSpeech() = Unit
 
         override fun onError(error: Int) {
+            MicCoordinator.release(MicOwner.INCOMING_CALL)
             if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
                 destroyRecognizerCleanly()
             } else {
                 stopRecognizerCleanly()
             }
-            scheduleCallListeningRestart(220L)
+            scheduleCallListeningRestart(MicCoordinator.ERROR_RESTART_DEBOUNCE_MS)
         }
 
         override fun onResults(results: Bundle?) {
             stopRecognizerCleanly()
+            MicCoordinator.release(MicOwner.INCOMING_CALL)
             val spoken = results
                 ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 ?.firstOrNull()
                 ?.trim()
                 .orEmpty()
             if (spoken.isBlank()) {
-                scheduleCallListeningRestart(220L)
+                scheduleCallListeningRestart(MicCoordinator.ERROR_RESTART_DEBOUNCE_MS)
             } else {
                 handleUserCallUtterance(spoken)
             }
@@ -577,9 +609,10 @@ class JarvisIncomingCallActivity : ComponentActivity() {
         _isMuted.value = next
         if (next) {
             stopRecognizerCleanly()
+            MicCoordinator.release(MicOwner.INCOMING_CALL)
             _statusLine.value = "MICROPHONE MUTED"
         } else {
-            scheduleCallListeningRestart(150L)
+            scheduleCallListeningRestart(200L)
         }
     }
 
@@ -592,6 +625,8 @@ class JarvisIncomingCallActivity : ComponentActivity() {
         destroyRecognizerCleanly()
         voiceEngine.stop()
         _isCallActive.value = false
+        MicCoordinator.setIncomingCallActive(false)
+        MicCoordinator.release(MicOwner.INCOMING_CALL)
         finish()
     }
 
@@ -612,6 +647,7 @@ class JarvisIncomingCallActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        MicCoordinator.unregisterSpeechPauseListener(pauseOnSpeechListener)
         stopRingingAndVibrating()
         callTimerJob?.cancel()
         restartListenJob?.cancel()
@@ -619,6 +655,8 @@ class JarvisIncomingCallActivity : ComponentActivity() {
         destroyRecognizerCleanly()
         voiceEngine.shutdown()
         _isCallActive.value = false
+        MicCoordinator.setIncomingCallActive(false)
+        MicCoordinator.release(MicOwner.INCOMING_CALL)
         super.onDestroy()
     }
 
@@ -686,7 +724,6 @@ private fun JarvisCallScreenUi(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // Top caller identity
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Surface(
                     shape = RoundedCornerShape(999.dp),
@@ -720,7 +757,6 @@ private fun JarvisCallScreenUi(
                 )
             }
 
-            // Center holographic Arc Reactor ring + purpose / live dialogue
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.fillMaxWidth()
@@ -800,7 +836,6 @@ private fun JarvisCallScreenUi(
                 }
             }
 
-            // Bottom Call Controls
             if (stage == CallStage.RINGING) {
                 Row(
                     modifier = Modifier

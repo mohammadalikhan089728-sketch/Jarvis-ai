@@ -116,6 +116,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        MicCoordinator.setMainActivityActive(true)
+    }
+
+    override fun onPause() {
+        MicCoordinator.setMainActivityActive(false)
+        super.onPause()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
@@ -133,13 +143,14 @@ class MainActivity : ComponentActivity() {
                 action == "android.intent.action.VOICE_ASSIST"
 
         if (initialCommand.isNotEmpty()) {
-            viewModel.submitCommand(initialCommand)
+            viewModel.startLiveSession(initialCommand = initialCommand)
         } else if (shouldStartListening) {
             viewModel.startLiveSession()
         }
     }
 
     override fun onDestroy() {
+        MicCoordinator.setMainActivityActive(false)
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         super.onDestroy()
     }

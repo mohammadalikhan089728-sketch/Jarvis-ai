@@ -62,7 +62,7 @@ data class SettingsEntity(
     val masterSystemPrompt: String = DEFAULT_MASTER_PROMPT,
     val voiceMode: String = VOICE_MODE_NORMAL,
     val customVoiceUrl: String = "",
-    val voicePitch: Float = 0.88f,
+    val voicePitch: Float = 0.92f,
     val voiceSpeed: Float = 1.02f,
     val wakeWordEnabled: Boolean = false,
     val autoReadScreenContext: Boolean = true,

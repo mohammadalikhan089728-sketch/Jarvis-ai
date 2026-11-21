@@ -709,12 +709,14 @@ class JarvisAgentEngine(
     }
 
     private suspend fun logAndReturn(query: String, result: AgentExecutionResult) {
+        val cleanReply = JarvisResponseSanitizer.extractCleanReply(result.reply)
+            .ifBlank { "Done, sir." }
         repository.logInteraction(
             ChatHistoryEntity(
                 userTranscript = query,
                 executedAction = result.executedAction,
                 actionParamsJson = result.paramsJson,
-                jarvisReply = result.reply,
+                jarvisReply = cleanReply,
                 isOffline = result.isOffline,
                 latencyMs = result.latencyMs
             )

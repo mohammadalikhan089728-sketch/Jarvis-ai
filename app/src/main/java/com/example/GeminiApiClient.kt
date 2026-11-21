@@ -1,15 +1,24 @@
 package com.example
 
 import android.util.Base64
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 data class JarvisAiAction(
     val action: String,
@@ -27,15 +36,120 @@ sealed interface KeyVerificationResult {
     data class Invalid(val message: String) : KeyVerificationResult
 }
 
+/**
+ * Strict text sanitizer guaranteeing JARVIS NEVER displays or speaks raw markdown fences,
+ * JSON wrappers ("json { reply: ... }"), brackets, asterisks, or third-party AI brand names.
+ */
+object JarvisResponseSanitizer {
+
+    private val FENCE_PREFIX_REGEX = Regex("^```(?:json|JSON)?\\s*")
+    private val FENCE_SUFFIX_REGEX = Regex("\\s*```$")
+    private val LEADING_JSON_WORD_REGEX = Regex("^(?:json|JSON)\\s*(?=\\{)")
+    private val REPLY_FIELD_REGEX = Regex(""""reply"\s*:\s*"((?:[^"\\]|\\.)*)"""")
+    private val TEXT_FIELD_REGEX = Regex(""""(?:text|message|response)"\s*:\s*"((?:[^"\\]|\\.)*)"""")
+    private val FORBIDDEN_CHARS_REGEX = Regex("""[\{\}\[\]"\*`#]""")
+    private val BRAND_LEAK_REGEX = Regex("(?i)gemini[\\w.-]*")
+    private val MULTI_SPACE_REGEX = Regex("\\s+")
+
+    /**
+     * Parses raw AI output that might be wrapped in markdown fences or JSON (`json { "reply": "..." }`),
+     * extracts ONLY the human-readable `"reply"` value, and removes all stray brackets/symbols.
+     */
+    fun extractCleanReply(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return ""
+
+        val unfenced = stripMarkdownFences(trimmed)
+        val extracted = extractReplyFromPossibleJson(unfenced) ?: unfenced
+        return sanitizePlainSpeechText(extracted)
+    }
+
+    /**
+     * Final safety pass before UI rendering or TTS/AI Voice playback.
+     */
+    fun sanitizePlainSpeechText(raw: String): String {
+        if (raw.isBlank()) return ""
+        var text = stripMarkdownFences(raw)
+        if (looksLikeJsonEnvelope(text)) {
+            extractReplyFromPossibleJson(text)?.let { text = it }
+        }
+        return text
+            .replace("\\n", " ")
+            .replace("\\\"", "")
+            .replace(Regex("(?i)^\\s*json\\s*:?\\s*"), "")
+            .replace(Regex("(?i)^\\s*reply\\s*:\\s*"), "")
+            .replace("**", "")
+            .replace("__", "")
+            .replace(FORBIDDEN_CHARS_REGEX, " ")
+            .replace(BRAND_LEAK_REGEX, "JARVIS Core")
+            .replace(MULTI_SPACE_REGEX, " ")
+            .trim()
+    }
+
+    fun looksLikeJsonEnvelope(text: String): Boolean {
+        val t = text.trimStart()
+        return t.startsWith("{") ||
+            t.startsWith("```") ||
+            t.startsWith("json", ignoreCase = true) && (t.contains("{") || t.contains("reply"))
+    }
+
+    fun stripMarkdownFences(raw: String): String {
+        var cleaned = raw.trim()
+        cleaned = FENCE_PREFIX_REGEX.replace(cleaned, "")
+        cleaned = FENCE_SUFFIX_REGEX.replace(cleaned, "")
+        cleaned = LEADING_JSON_WORD_REGEX.replace(cleaned, "")
+        return cleaned.trim()
+    }
+
+    private fun extractReplyFromPossibleJson(candidate: String): String? {
+        val start = candidate.indexOf('{')
+        val end = candidate.lastIndexOf('}')
+        if (start >= 0 && end > start) {
+            val jsonSlice = candidate.substring(start, end + 1)
+            runCatching {
+                val obj = JSONObject(jsonSlice)
+                val reply = obj.optString("reply", "").trim()
+                if (reply.isNotEmpty()) return reply
+                val text = obj.optString("text", "").trim()
+                if (text.isNotEmpty()) return text
+                val message = obj.optString("message", "").trim()
+                if (message.isNotEmpty()) return message
+            }
+        }
+
+        // Fallback regex extraction if JSON was truncated or malformed
+        val replyMatch = REPLY_FIELD_REGEX.find(candidate)
+            ?: TEXT_FIELD_REGEX.find(candidate)
+        if (replyMatch != null) {
+            return unescapeJsonString(replyMatch.groupValues[1])
+        }
+        return null
+    }
+
+    private fun unescapeJsonString(escaped: String): String {
+        return escaped
+            .replace("\\n", " ")
+            .replace("\\r", " ")
+            .replace("\\t", " ")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+            .trim()
+    }
+}
+
 class GeminiApiClient {
 
     companion object {
-        // Strictly locked internal neural engine identifier (never exposed in UI strings)
+        // Strictly locked internal neural engine identifiers (never exposed in UI strings)
         const val MODEL_NAME = "gemini-3.5-flash"
+        const val LIVE_AUDIO_MODEL_NAME = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+
         private const val GENERATE_ENDPOINT_URL =
             "https://generativelanguage.googleapis.com/v1beta/models/$MODEL_NAME:generateContent"
         private const val STREAM_ENDPOINT_URL =
             "https://generativelanguage.googleapis.com/v1beta/models/$MODEL_NAME:streamGenerateContent?alt=sse"
+        private const val BIDI_LIVE_WS_BASE_URL =
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
 
@@ -43,7 +157,17 @@ class GeminiApiClient {
         .connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(40, TimeUnit.SECONDS)
         .writeTimeout(12, TimeUnit.SECONDS)
+        .pingInterval(15, TimeUnit.SECONDS)
         .build()
+
+    @Volatile
+    private var activeVoiceWebSocket: WebSocket? = null
+
+    fun cancelActiveVoiceStream() {
+        val ws = activeVoiceWebSocket
+        activeVoiceWebSocket = null
+        runCatching { ws?.close(1000, "Cancelled") }
+    }
 
     suspend fun verifyApiKey(rawApiKey: String): KeyVerificationResult = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
@@ -102,111 +226,233 @@ class GeminiApiClient {
     }
 
     /**
-     * Generates native human-like AI audio bytes (PCM / WAV) via responseModalities: ["AUDIO"]
-     * with selectable male voice ("Charon" or "Fenrir") for "With AI Voice" mode.
+     * Real-time Multimodal Live WebSocket audio streaming for "With AI Voice" mode.
+     * Connects to BidiGenerateContent using models/gemini-2.5-flash-native-audio-preview-12-2025,
+     * requests response_modalities: ["AUDIO"] with selectable deep male voice ("Charon" or "Fenrir"),
+     * and streams incoming 24kHz 16-bit PCM chunks directly to [onPcmChunk] as they arrive (~400ms latency).
      */
-    suspend fun requestAiVoiceAudio(
+    suspend fun streamLiveAiVoice(
         rawApiKey: String,
         textToSpeak: String,
-        voiceName: String = AI_VOICE_CHARON
-    ): Result<AiAudioPayload> = withContext(Dispatchers.IO) {
+        voiceName: String = AI_VOICE_CHARON,
+        onPcmChunk: (pcmBytes: ByteArray, sampleRateHz: Int) -> Unit
+    ): Result<Int> = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
-        val cleanText = textToSpeak.trim()
+        val cleanText = JarvisResponseSanitizer.extractCleanReply(textToSpeak)
         if (apiKey.isEmpty() || cleanText.isEmpty()) {
-            return@withContext Result.failure(IllegalStateException("AI Voice requires an active API key and text."))
+            return@withContext Result.failure(IllegalStateException("AI Voice requires an active key and clean text."))
         }
 
         val resolvedVoice = if (voiceName == AI_VOICE_FENRIR) AI_VOICE_FENRIR else AI_VOICE_CHARON
-        try {
-            val payload = JSONObject().apply {
+        val encodedKey = URLEncoder.encode(apiKey, "UTF-8")
+        val wsUrl = "$BIDI_LIVE_WS_BASE_URL?key=$encodedKey"
+
+        val completion = CompletableDeferred<Result<Int>>()
+        val setupSent = AtomicBoolean(false)
+        val promptSent = AtomicBoolean(false)
+        val chunkCount = AtomicInteger(0)
+
+        cancelActiveVoiceStream()
+
+        fun buildSetupJson(): String {
+            return JSONObject().apply {
                 put(
-                    "contents",
-                    JSONArray().put(
-                        JSONObject().apply {
-                            put("role", "user")
-                            put(
-                                "parts",
-                                JSONArray().put(
-                                    JSONObject().put(
-                                        "text",
-                                        "Read the following JARVIS response aloud naturally, clearly, and authoritatively without adding extra words:\n$cleanText"
-                                    )
-                                )
-                            )
-                        }
-                    )
-                )
-                put(
-                    "generationConfig",
+                    "setup",
                     JSONObject().apply {
-                        put("responseModalities", JSONArray().put("AUDIO"))
+                        put("model", LIVE_AUDIO_MODEL_NAME)
                         put(
-                            "speechConfig",
+                            "generationConfig",
                             JSONObject().apply {
+                                put("responseModalities", JSONArray().put("AUDIO"))
                                 put(
-                                    "voiceConfig",
+                                    "speechConfig",
                                     JSONObject().apply {
                                         put(
-                                            "prebuiltVoiceConfig",
+                                            "voiceConfig",
                                             JSONObject().apply {
-                                                put("voiceName", resolvedVoice)
+                                                put(
+                                                    "prebuiltVoiceConfig",
+                                                    JSONObject().apply {
+                                                        put("voiceName", resolvedVoice)
+                                                    }
+                                                )
                                             }
                                         )
                                     }
                                 )
                             }
                         )
-                    }
-                )
-            }
-
-            val request = Request.Builder()
-                .url(GENERATE_ENDPOINT_URL)
-                .header("x-goog-api-key", apiKey)
-                .header("Content-Type", "application/json")
-                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                val body = response.body?.string().orEmpty()
-                if (!response.isSuccessful) {
-                    return@withContext Result.failure(
-                        IllegalStateException("AI Voice stream unavailable (${response.code}).")
-                    )
-                }
-
-                val root = JSONObject(body)
-                val candidates = root.optJSONArray("candidates") ?: return@withContext Result.failure(
-                    IllegalStateException("No audio candidate returned.")
-                )
-                for (c in 0 until candidates.length()) {
-                    val parts = candidates.optJSONObject(c)
-                        ?.optJSONObject("content")
-                        ?.optJSONArray("parts") ?: continue
-                    for (p in 0 until parts.length()) {
-                        val inlineData = parts.optJSONObject(p)?.optJSONObject("inlineData") ?: continue
-                        val b64 = inlineData.optString("data", "")
-                        val mime = inlineData.optString("mimeType", "audio/L16;codec=pcm;rate=24000")
-                        if (b64.isNotBlank()) {
-                            val decoded = Base64.decode(b64, Base64.DEFAULT)
-                            if (decoded.isNotEmpty()) {
-                                return@withContext Result.success(
-                                    AiAudioPayload(audioBytes = decoded, mimeType = mime)
+                        put(
+                            "systemInstruction",
+                            JSONObject().apply {
+                                put(
+                                    "parts",
+                                    JSONArray().put(
+                                        JSONObject().put(
+                                            "text",
+                                            "You are JARVIS, developed by Mozahid. Speak the exact text provided by the user naturally, calmly, and clearly in a deep male voice. Do not add extra words, labels, or commentary."
+                                        )
+                                    )
                                 )
                             }
+                        )
+                    }
+                )
+            }.toString()
+        }
+
+        fun buildClientTurnJson(): String {
+            return JSONObject().apply {
+                put(
+                    "clientContent",
+                    JSONObject().apply {
+                        put(
+                            "turns",
+                            JSONArray().put(
+                                JSONObject().apply {
+                                    put("role", "user")
+                                    put(
+                                        "parts",
+                                        JSONArray().put(
+                                            JSONObject().put(
+                                                "text",
+                                                "Say this aloud verbatim with natural human intonation:\n$cleanText"
+                                            )
+                                        )
+                                    )
+                                }
+                            )
+                        )
+                        put("turnComplete", true)
+                    }
+                )
+            }.toString()
+        }
+
+        fun handleServerJsonFrame(webSocket: WebSocket, rawJson: String) {
+            try {
+                val root = JSONObject(rawJson)
+
+                // Handle setupComplete handshake -> send client text turn
+                if (root.has("setupComplete") && promptSent.compareAndSet(false, true)) {
+                    webSocket.send(buildClientTurnJson())
+                    return
+                }
+
+                // Handle server error frame
+                if (root.has("error")) {
+                    val errMsg = sanitizeErrorText(root.optJSONObject("error")?.optString("message").orEmpty())
+                    completion.complete(Result.failure(IllegalStateException(errMsg.ifBlank { "Live audio error" })))
+                    runCatching { webSocket.close(1000, "Error") }
+                    return
+                }
+
+                val serverContent = root.optJSONObject("serverContent") ?: return
+                val modelTurn = serverContent.optJSONObject("modelTurn")
+                val parts = modelTurn?.optJSONArray("parts")
+                if (parts != null) {
+                    for (i in 0 until parts.length()) {
+                        val inlineData = parts.optJSONObject(i)?.optJSONObject("inlineData") ?: continue
+                        val b64 = inlineData.optString("data", "")
+                        if (b64.isBlank()) continue
+                        val mime = inlineData.optString("mimeType", "audio/pcm;rate=24000")
+                        val sampleRate = parsePcmSampleRate(mime)
+                        val decoded = Base64.decode(b64, Base64.DEFAULT)
+                        if (decoded.isNotEmpty()) {
+                            chunkCount.incrementAndGet()
+                            onPcmChunk(decoded, sampleRate)
                         }
                     }
                 }
-                Result.failure(IllegalStateException("No inline audio payload present in AI Voice response."))
+
+                if (serverContent.optBoolean("turnComplete", false)) {
+                    val total = chunkCount.get()
+                    if (total > 0) {
+                        completion.complete(Result.success(total))
+                    } else {
+                        completion.complete(Result.failure(IllegalStateException("Live audio turn completed without PCM chunks.")))
+                    }
+                    runCatching { webSocket.close(1000, "Turn complete") }
+                }
+            } catch (_: Exception) {
+                // Ignore non-JSON keepalive frames
             }
-        } catch (e: Exception) {
-            Result.failure(e)
         }
+
+        val request = Request.Builder()
+            .url(wsUrl)
+            .build()
+
+        val ws = httpClient.newWebSocket(
+            request,
+            object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    if (setupSent.compareAndSet(false, true)) {
+                        webSocket.send(buildSetupJson())
+                    }
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    handleServerJsonFrame(webSocket, text)
+                }
+
+                override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                    // Multimodal Live WebSocket typically sends JSON envelopes as binary UTF-8 frames
+                    handleServerJsonFrame(webSocket, bytes.utf8())
+                }
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    val total = chunkCount.get()
+                    if (!completion.isCompleted) {
+                        if (total > 0) {
+                            completion.complete(Result.success(total))
+                        } else {
+                            completion.complete(Result.failure(IllegalStateException("Live audio stream closed ($code).")))
+                        }
+                    }
+                    runCatching { webSocket.close(1000, null) }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    if (!completion.isCompleted) {
+                        val total = chunkCount.get()
+                        if (total > 0) {
+                            completion.complete(Result.success(total))
+                        } else {
+                            completion.complete(
+                                Result.failure(
+                                    IllegalStateException(
+                                        sanitizeErrorText(t.localizedMessage ?: "Live audio WebSocket unavailable.")
+                                    )
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        )
+        activeVoiceWebSocket = ws
+
+        val outcome = withTimeoutOrNull(22_000L) {
+            completion.await()
+        } ?: run {
+            runCatching { ws.close(1000, "Timeout") }
+            if (chunkCount.get() > 0) {
+                Result.success(chunkCount.get())
+            } else {
+                Result.failure(IllegalStateException("Live AI Voice WebSocket timed out."))
+            }
+        }
+
+        if (activeVoiceWebSocket === ws) {
+            activeVoiceWebSocket = null
+        }
+        outcome
     }
 
     /**
-     * Ultra-fast real-time SSE streaming conversational reply.
-     * Flushes completed sentences immediately on '.', '?', '!', '।', or newline so Normal Voice starts in ~400ms.
+     * Ultra-fast real-time SSE streaming conversational reply using gemini-3.5-flash.
+     * Buffers any accidental JSON/markdown wrapper before emitting so TTS NEVER speaks "json", "{", or "reply".
      */
     suspend fun streamConversationalReply(
         rawApiKey: String,
@@ -229,7 +475,7 @@ class GeminiApiClient {
                 appendLine()
                 appendLine("IDENTITY & VOICE OUTPUT RULES:")
                 appendLine("- You are JARVIS, developed by Mozahid. Never mention any external AI brand or model name.")
-                appendLine("- Respond in clean, natural spoken sentences (no markdown bullets, no asterisks, no JSON).")
+                appendLine("- Respond ONLY in clean, natural spoken sentences. NEVER output JSON, brackets, markdown fences, asterisks, or bullet lists.")
                 appendLine("- Keep sentences crisp and conversational so real-time voice synthesis sounds immediate.")
                 if (extraSystemGuidance.isNotBlank()) {
                     appendLine(extraSystemGuidance)
@@ -247,7 +493,15 @@ class GeminiApiClient {
                 contentsArray.put(
                     JSONObject().apply {
                         put("role", "model")
-                        put("parts", JSONArray().put(JSONObject().put("text", entry.jarvisReply)))
+                        put(
+                            "parts",
+                            JSONArray().put(
+                                JSONObject().put(
+                                    "text",
+                                    JarvisResponseSanitizer.extractCleanReply(entry.jarvisReply)
+                                )
+                            )
+                        )
                     }
                 )
             }
@@ -285,6 +539,8 @@ class GeminiApiClient {
 
             val fullText = StringBuilder()
             val sentenceBuffer = StringBuilder()
+            var detectedJsonStream = false
+            var emittedAnySentence = false
 
             httpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
@@ -310,24 +566,49 @@ class GeminiApiClient {
                     fullText.append(chunkText)
                     sentenceBuffer.append(chunkText)
 
-                    while (true) {
-                        val cutIndex = findSentenceBoundary(sentenceBuffer)
-                        if (cutIndex < 0) break
-                        val sentence = sanitizeSpokenSentence(sentenceBuffer.substring(0, cutIndex + 1))
-                        sentenceBuffer.delete(0, cutIndex + 1)
-                        if (sentence.isNotEmpty()) {
-                            onSentenceReady(sentence)
+                    // Guard: if the model unexpectedly begins outputting ```json or { ... }, hold until complete to extract ONLY "reply"
+                    val trimmedStart = fullText.toString().trimStart()
+                    if (!emittedAnySentence && (
+                            trimmedStart.startsWith("{") ||
+                                trimmedStart.startsWith("```") ||
+                                trimmedStart.startsWith("json", ignoreCase = true)
+                            )
+                    ) {
+                        detectedJsonStream = true
+                        continue
+                    }
+
+                    if (!detectedJsonStream) {
+                        while (true) {
+                            val cutIndex = findSentenceBoundary(sentenceBuffer)
+                            if (cutIndex < 0) break
+                            val sentence = JarvisResponseSanitizer.sanitizePlainSpeechText(
+                                sentenceBuffer.substring(0, cutIndex + 1)
+                            )
+                            sentenceBuffer.delete(0, cutIndex + 1)
+                            if (sentence.isNotEmpty()) {
+                                emittedAnySentence = true
+                                onSentenceReady(sentence)
+                            }
                         }
                     }
                 }
             }
 
-            val trailing = sanitizeSpokenSentence(sentenceBuffer.toString())
-            if (trailing.isNotEmpty()) {
-                onSentenceReady(trailing)
+            if (detectedJsonStream) {
+                val cleanReply = JarvisResponseSanitizer.extractCleanReply(fullText.toString())
+                if (cleanReply.isNotEmpty()) {
+                    onSentenceReady(cleanReply)
+                    return@withContext Result.success(cleanReply)
+                }
+            } else {
+                val trailing = JarvisResponseSanitizer.sanitizePlainSpeechText(sentenceBuffer.toString())
+                if (trailing.isNotEmpty()) {
+                    onSentenceReady(trailing)
+                }
             }
 
-            val combined = sanitizeSpokenSentence(fullText.toString())
+            val combined = JarvisResponseSanitizer.extractCleanReply(fullText.toString())
             if (combined.isBlank()) {
                 Result.failure(IllegalStateException("Empty response from JARVIS AI Core."))
             } else {
@@ -339,7 +620,8 @@ class GeminiApiClient {
     }
 
     /**
-     * Autonomous multi-step phone automation decision call.
+     * Autonomous multi-step phone automation decision call on gemini-3.5-flash.
+     * Strictly parses JSON and sanitizes the "reply" field so brackets or JSON keys never reach TTS/UI.
      */
     suspend fun requestAgentAction(
         rawApiKey: String,
@@ -381,7 +663,7 @@ class GeminiApiClient {
                                         JSONObject().apply {
                                             put("action", entry.executedAction)
                                             put("params", JSONObject())
-                                            put("reply", entry.jarvisReply)
+                                            put("reply", JarvisResponseSanitizer.extractCleanReply(entry.jarvisReply))
                                         }.toString()
                                     )
                                 )
@@ -471,7 +753,7 @@ class GeminiApiClient {
                 appendLine("- You are replying on the user's behalf in $appLabel to \"$senderName\".")
                 appendLine("- Sound completely natural, warm, concise, and human-like (1-2 short casual sentences max).")
                 appendLine("- Match the sender's language (Hindi, Hinglish, or English) automatically.")
-                appendLine("- Output ONLY the exact message text to send. Never mention any AI brand.")
+                appendLine("- Output ONLY the exact message text to send. Never output JSON or mention any AI brand.")
             }
 
             val convoHistory = buildString {
@@ -513,7 +795,7 @@ class GeminiApiClient {
             }
 
             executeStreamingCollect(apiKey, payload).map { text ->
-                text.trim().trim('"', '\'').take(400)
+                JarvisResponseSanitizer.extractCleanReply(text).take(400)
             }
         } catch (e: Exception) {
             Result.failure(e)
@@ -573,13 +855,9 @@ class GeminiApiClient {
         return -1
     }
 
-    private fun sanitizeSpokenSentence(raw: String): String {
-        return raw
-            .replace("**", "")
-            .replace("__", "")
-            .replace("`", "")
-            .replace(Regex("\\s+"), " ")
-            .trim()
+    private fun parsePcmSampleRate(mimeType: String): Int {
+        val match = Regex("rate=(\\d+)").find(mimeType.lowercase())
+        return match?.groupValues?.getOrNull(1)?.toIntOrNull()?.coerceIn(8000, 48000) ?: 24000
     }
 
     private fun sanitizeErrorText(raw: String): String {
@@ -596,7 +874,7 @@ You MUST respond with a single valid JSON object matching this exact schema:
 {
   "action": "OPEN_APP" | "TAP_TEXT" | "TAP_XY" | "LONG_PRESS" | "TYPE_TEXT" | "SWIPE" | "SCROLL_DOWN" | "SCROLL_UP" | "SCROLL" | "DRAG" | "MULTI_TOUCH" | "BACK" | "HOME" | "RECENTS" | "GLOBAL" | "DONE" | "SPEAK",
   "params": { ... },
-  "reply": "Short spoken confirmation or answer for the user"
+  "reply": "Short clean spoken sentence for the user with no markdown or symbols"
 }
 
 MULTI-STEP RULES:
@@ -647,12 +925,7 @@ Never include markdown fences or commentary outside the JSON object.
     }
 
     private fun parseActionJson(rawText: String): JarvisAiAction {
-        val cleaned = rawText
-            .removePrefix("```json")
-            .removePrefix("```")
-            .removeSuffix("```")
-            .trim()
-
+        val cleaned = JarvisResponseSanitizer.stripMarkdownFences(rawText)
         val jsonStart = cleaned.indexOf('{')
         val jsonEnd = cleaned.lastIndexOf('}')
         val candidateJson = if (jsonStart >= 0 && jsonEnd > jsonStart) {
@@ -665,13 +938,18 @@ Never include markdown fences or commentary outside the JSON object.
             val obj = JSONObject(candidateJson)
             val action = obj.optString("action", "SPEAK").trim().uppercase().ifBlank { "SPEAK" }
             val params = obj.optJSONObject("params") ?: JSONObject()
-            val reply = obj.optString("reply", "").trim().ifBlank { "Done, sir." }
-            JarvisAiAction(action = action, params = params, reply = reply)
+            val cleanReply = JarvisResponseSanitizer.sanitizePlainSpeechText(
+                obj.optString("reply", "")
+            ).ifBlank { "Done, sir." }
+            JarvisAiAction(action = action, params = params, reply = cleanReply)
         } catch (_: Exception) {
+            val cleanFallback = JarvisResponseSanitizer.extractCleanReply(rawText)
+                .take(360)
+                .ifBlank { "Command processed, sir." }
             JarvisAiAction(
                 action = "SPEAK",
                 params = JSONObject(),
-                reply = cleaned.take(360).ifBlank { "Command processed." }
+                reply = cleanFallback
             )
         }
     }
