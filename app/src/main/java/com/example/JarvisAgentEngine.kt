@@ -1,6 +1,7 @@
 package com.example
 
 import android.content.Context
+import android.content.Intent
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -19,7 +20,7 @@ data class AgentExecutionResult(
 class JarvisAgentEngine(
     private val appContext: Context,
     private val repository: JarvisRepository,
-    private val geminiApiClient: GeminiApiClient,
+    private val aiClient: GeminiApiClient,
     private val offlineProcessor: OfflineCommandProcessor
 ) {
 
@@ -36,13 +37,19 @@ class JarvisAgentEngine(
         val query = rawQuery.trim()
         val normalizedLower = query.lowercase(Locale.ROOT)
 
-        // 1. Voice-controlled Autonomous Auto-Reply Mode toggle & target contact setup
+        // 1. Voice-created Scheduled JARVIS Calls ("Kal subah 6 baje padhne ke liye call karna")
+        handleVoiceScheduleCallCommand(query, normalizedLower, startMs)?.let { result ->
+            logAndReturn(query, result)
+            return result
+        }
+
+        // 2. Voice-controlled Autonomous Auto-Reply Mode toggle & target contact setup
         handleAutoReplyControlCommand(query, normalizedLower, startMs)?.let { result ->
             logAndReturn(query, result)
             return result
         }
 
-        // 2. Local Auto-Chat Logs query ("Kiska message aaya tha?", "Ashif se kya baat hui?")
+        // 3. Local Auto-Chat Logs query ("Kiska message aaya tha?", "Ashif se kya baat hui?")
         if (isAutoChatLogQuery(normalizedLower)) {
             val result = handleAutoChatLogQuery(
                 query = query,
@@ -58,7 +65,7 @@ class JarvisAgentEngine(
             return result
         }
 
-        // 3. Instant Screen Explainer / Hindi Translator ("Screen par kya likha hai?", "Isko Hindi me samjhao")
+        // 4. Instant Screen Explainer / Hindi Translator ("Screen par kya likha hai?", "Isko Hindi me samjhao")
         if (isScreenExplainOrTranslateQuery(normalizedLower)) {
             val result = handleScreenExplainOrTranslate(
                 query = query,
@@ -74,7 +81,7 @@ class JarvisAgentEngine(
             return result
         }
 
-        // 4. Local Room Custom Macros
+        // 5. Local Room Custom Macros
         val macros = repository.getAllMacros()
         val matchedMacro = macros.firstOrNull { macro ->
             val trigger = macro.triggerPhrase.trim().lowercase(Locale.ROOT)
@@ -89,7 +96,7 @@ class JarvisAgentEngine(
             return finalRes
         }
 
-        // 5. Instant Offline Execution (<100ms) for single-step device actions
+        // 6. Instant Offline Execution (<100ms) for single-step device actions
         val offlineMatch = offlineProcessor.tryExecute(query)
         if (offlineMatch != null && (settings.offlineFirstMode || settings.geminiApiKey.isBlank())) {
             onPhaseUpdate(JarvisPhase.ACTING)
@@ -105,14 +112,14 @@ class JarvisAgentEngine(
             return res
         }
 
-        // 6. Offline-only fallback when Gemini API key is not configured
+        // 7. Offline-only fallback when AI Core API key is not configured
         if (settings.geminiApiKey.isBlank()) {
             val screenSnapshot = JarvisAccessibilityService.instance?.readScreenHierarchy()
             val reply = if (normalizedLower.contains("read") && normalizedLower.contains("screen")) {
                 screenSnapshot?.toHumanSummary()
                     ?: "Accessibility Service is inactive. Activate it in Systems so I can read the screen."
             } else {
-                "Offline command not recognized and no Gemini API key is saved. Open Config to add your key for gemini-3.5-flash."
+                "Offline command not recognized and no JARVIS AI Core API key is saved. Open Config to enter your key."
             }
             val elapsed = System.currentTimeMillis() - startMs
             val res = AgentExecutionResult("OFFLINE:SPEAK", "{}", reply, true, elapsed)
@@ -120,12 +127,12 @@ class JarvisAgentEngine(
             return res
         }
 
-        // 7. Ultra-Fast Streaming Conversational Q&A (~400ms first-sentence TTS) when no device/UI action is requested
+        // 8. Ultra-Fast Streaming Conversational Q&A (~400ms first-sentence TTS) when no phone UI action is needed
         if (isPureConversationalQuery(normalizedLower)) {
             onPhaseUpdate(JarvisPhase.THINKING)
             val recentHistory = repository.getRecentHistory(limit = 4)
             var startedSpeaking = false
-            val streamResult = geminiApiClient.streamConversationalReply(
+            val streamResult = aiClient.streamConversationalReply(
                 rawApiKey = settings.geminiApiKey,
                 masterSystemPrompt = settings.masterSystemPrompt,
                 userPrompt = query,
@@ -147,7 +154,7 @@ class JarvisAgentEngine(
             val res = streamResult.fold(
                 onSuccess = { fullReply ->
                     AgentExecutionResult(
-                        executedAction = "GEMINI:STREAM_SPEAK",
+                        executedAction = "JARVIS:STREAM_SPEAK",
                         paramsJson = "{}",
                         reply = fullReply,
                         isOffline = false,
@@ -157,9 +164,9 @@ class JarvisAgentEngine(
                 },
                 onFailure = { err ->
                     AgentExecutionResult(
-                        executedAction = "ERROR:GEMINI",
+                        executedAction = "ERROR:CORE",
                         paramsJson = "{}",
-                        reply = err.localizedMessage ?: "Unable to reach gemini-3.5-flash right now.",
+                        reply = err.localizedMessage ?: "Unable to reach JARVIS AI Core right now.",
                         isOffline = false,
                         latencyMs = elapsed,
                         alreadyStreamSpoken = false
@@ -170,7 +177,7 @@ class JarvisAgentEngine(
             return res
         }
 
-        // 8. Autonomous Multi-Step Phone Execution Loop (up to 8 sequential steps) via gemini-3.5-flash
+        // 9. Autonomous Multi-Step Phone Control Loop (up to 8 sequential steps)
         val multiStepResult = executeAutonomousMultiStepLoop(
             goalQuery = query,
             settings = settings,
@@ -182,6 +189,80 @@ class JarvisAgentEngine(
         return multiStepResult
     }
 
+    private suspend fun handleVoiceScheduleCallCommand(
+        query: String,
+        lower: String,
+        startMs: Long
+    ): AgentExecutionResult? {
+        val mentionsScheduleCall = (lower.contains("call karna") ||
+            lower.contains("call kar dena") ||
+            lower.contains("mujhe call") ||
+            lower.contains("schedule a call") ||
+            lower.contains("schedule call") ||
+            lower.contains("call me at") ||
+            lower.contains("uthana hai") ||
+            lower.contains("utha dena")) &&
+            (lower.contains("baje") || lower.contains("am") || lower.contains("pm") || lower.contains(":"))
+
+        if (!mentionsScheduleCall) return null
+
+        val timeRegex = Regex("(\\d{1,2})(?::(\\d{2}))?\\s*(a\\.?m\\.?|p\\.?m\\.?|baje)?", RegexOption.IGNORE_CASE)
+        val match = timeRegex.find(lower) ?: return null
+        var hour = match.groupValues[1].toIntOrNull() ?: return null
+        val minute = match.groupValues[2].toIntOrNull()?.coerceIn(0, 59) ?: 0
+        val suffix = match.groupValues[3].lowercase(Locale.ROOT).replace(".", "")
+
+        val isMorningHint = lower.contains("subah") || lower.contains("morning") || suffix == "am"
+        val isEveningHint = lower.contains("shaam") || lower.contains("raat") || lower.contains("dopahar") ||
+            lower.contains("afternoon") || lower.contains("evening") || lower.contains("night") || suffix == "pm"
+
+        if (isEveningHint && hour in 1..11) {
+            hour += 12
+        } else if (isMorningHint && hour == 12) {
+            hour = 0
+        }
+        hour = hour.coerceIn(0, 23)
+
+        val actionType = when {
+            lower.contains("padh") || lower.contains("study") || lower.contains("utha") || lower.contains("wake") ->
+                CALL_TYPE_WAKE_UP_STUDY
+            lower.contains("view") || lower.contains("instagram") || lower.contains("youtube") || lower.contains("reel") ->
+                CALL_TYPE_SMART_VIEWS_CHECK
+            else -> CALL_TYPE_CUSTOM_REMINDER
+        }
+        val repeatCsv = if (lower.contains("daily") || lower.contains("roz") || lower.contains("har roz")) {
+            "DAILY"
+        } else {
+            "ONCE"
+        }
+
+        val callEntity = ScheduledCallEntity(
+            hour = hour,
+            minute = minute,
+            purpose = query,
+            actionType = actionType,
+            repeatDaysCsv = repeatCsv,
+            enabled = true
+        )
+        val savedId = repository.saveScheduledCall(callEntity)
+        val scheduled = callEntity.copy(id = savedId)
+        CallAlarmScheduler.scheduleCall(appContext, scheduled)
+
+        val timeLabel = CallAlarmScheduler.formatTime12Hour(hour, minute)
+        val elapsed = System.currentTimeMillis() - startMs
+        return AgentExecutionResult(
+            executedAction = "CALL_SCHEDULED",
+            paramsJson = JSONObject()
+                .put("time", timeLabel)
+                .put("type", actionType)
+                .put("repeat", repeatCsv)
+                .toString(),
+            reply = "Done Sir. JARVIS will call you at $timeLabel for: $query.",
+            isOffline = true,
+            latencyMs = elapsed
+        )
+    }
+
     private suspend fun executeAutonomousMultiStepLoop(
         goalQuery: String,
         settings: SettingsEntity,
@@ -191,7 +272,7 @@ class JarvisAgentEngine(
     ): AgentExecutionResult {
         val recentHistory = repository.getRecentHistory(limit = 3)
         val stepHistory = mutableListOf<String>()
-        var lastActionTag = "GEMINI:DONE"
+        var lastActionTag = "JARVIS:DONE"
         var lastParamsJson = "{}"
         var finalReply = "Task completed, sir."
         var stepsExecuted = 0
@@ -203,7 +284,7 @@ class JarvisAgentEngine(
         try {
             for (step in 1..MAX_AGENT_STEPS) {
                 if (JarvisAccessibilityService.isStopRequested()) {
-                    finalReply = "Autonomous execution stopped by user after $stepsExecuted steps."
+                    finalReply = "Autonomous execution stopped after $stepsExecuted steps."
                     lastActionTag = "AGENT:STOPPED"
                     break
                 }
@@ -220,7 +301,7 @@ class JarvisAgentEngine(
                     null
                 }
 
-                val aiResult = geminiApiClient.requestAgentAction(
+                val aiResult = aiClient.requestAgentAction(
                     rawApiKey = settings.geminiApiKey,
                     masterSystemPrompt = settings.masterSystemPrompt,
                     userQuery = goalQuery,
@@ -234,16 +315,16 @@ class JarvisAgentEngine(
                 val aiAction = aiResult.getOrElse { err ->
                     val elapsed = System.currentTimeMillis() - startMs
                     return AgentExecutionResult(
-                        executedAction = "ERROR:GEMINI",
+                        executedAction = "ERROR:CORE",
                         paramsJson = "{}",
-                        reply = err.localizedMessage ?: "Unable to reach gemini-3.5-flash right now.",
+                        reply = err.localizedMessage ?: "Unable to reach JARVIS AI Core right now.",
                         isOffline = false,
                         latencyMs = elapsed
                     )
                 }
 
                 val actionUpper = aiAction.action.uppercase(Locale.ROOT)
-                lastActionTag = if (stepsExecuted > 0) "AGENT(${stepsExecuted + 1}):$actionUpper" else "GEMINI:$actionUpper"
+                lastActionTag = if (stepsExecuted > 0) "AGENT(${stepsExecuted + 1}):$actionUpper" else "JARVIS:$actionUpper"
                 lastParamsJson = aiAction.params.toString()
                 finalReply = aiAction.reply
 
@@ -252,7 +333,7 @@ class JarvisAgentEngine(
                 }
 
                 if (JarvisAccessibilityService.isStopRequested()) {
-                    finalReply = "Autonomous execution stopped by user."
+                    finalReply = "Autonomous execution stopped."
                     lastActionTag = "AGENT:STOPPED"
                     break
                 }
@@ -265,17 +346,13 @@ class JarvisAgentEngine(
 
                 val execNote = executeStructuredAction(actionUpper, aiAction.params)
                 stepsExecuted++
-                stepHistory.add(
-                    "$actionUpper(${aiAction.params}) -> ${execNote ?: "OK"}"
-                )
+                stepHistory.add("$actionUpper(${aiAction.params}) -> ${execNote ?: "OK"}")
 
-                // If accessibility is inactive and action needed it, stop immediately instead of spinning
                 if (execNote != null && execNote.contains("Accessibility Service inactive", ignoreCase = true)) {
                     finalReply = "${aiAction.reply} ($execNote)"
                     break
                 }
 
-                // Single-step goals (not clearly multi-step) complete cleanly after 1 action
                 if (step == 1 && !looksLikeMultiStepGoal(goalQuery)) {
                     if (execNote != null) {
                         finalReply = "${aiAction.reply} ($execNote)"
@@ -283,13 +360,12 @@ class JarvisAgentEngine(
                     break
                 }
 
-                // Interruptible 900ms UI settle window before capturing updated screen hierarchy
-                val settleStepMs = 100L
+                val settleTickMs = 100L
                 var waited = 0L
                 while (waited < STEP_SETTLE_DELAY_MS) {
                     if (JarvisAccessibilityService.isStopRequested()) break
-                    delay(settleStepMs)
-                    waited += settleStepMs
+                    delay(settleTickMs)
+                    waited += settleTickMs
                 }
             }
         } finally {
@@ -318,7 +394,6 @@ class JarvisAgentEngine(
             lower.contains("auto chat") ||
             lower.contains("auto-chat")
 
-        // e.g. "Reply to Ashif automatically" / "Auto reply to Rahul"
         val replyToContactMatch = Regex(
             "(?:auto[ -]?reply\\s+to|reply\\s+to)\\s+([a-z0-9 ._-]+?)(?:\\s+automatically|\\s+on\\s+whatsapp|$)",
             RegexOption.IGNORE_CASE
@@ -383,7 +458,7 @@ class JarvisAgentEngine(
             lower.contains("kya baat hui") ||
             lower.contains("what did i talk") ||
             lower.contains("conversation with") ||
-            lower.contains("chat with") && (lower.contains("summary") || lower.contains("what") || lower.contains("kya"))
+            (lower.contains("chat with") && (lower.contains("summary") || lower.contains("what") || lower.contains("kya")))
     }
 
     private suspend fun handleAutoChatLogQuery(
@@ -396,7 +471,6 @@ class JarvisAgentEngine(
         onStreamSentence: (String) -> Unit,
         onStreamEnd: () -> Unit
     ): AgentExecutionResult {
-        // Extract contact name if asking about a specific sender (e.g. "Ashif se kya baat hui?")
         val hindiContactMatch = Regex("^([a-z0-9 ._-]+?)\\s+se\\s+kya\\s+baat", RegexOption.IGNORE_CASE).find(query)
         val englishContactMatch = Regex("(?:with|from)\\s+([a-z0-9 ._-]+?)[?.,!]*$", RegexOption.IGNORE_CASE).find(query)
         val specificSender = (hindiContactMatch?.groupValues?.getOrNull(1)
@@ -427,7 +501,7 @@ class JarvisAgentEngine(
 
         val timeFmt = SimpleDateFormat("h:mm a", Locale.getDefault())
         val formattedLogs = logs.joinToString("\n") { log ->
-            val who = if (log.direction == AUTO_CHAT_DIR_INCOMING) log.senderName else "Jarvis (Me)"
+            val who = if (log.direction == AUTO_CHAT_DIR_INCOMING) log.senderName else "JARVIS (Me)"
             "[${timeFmt.format(Date(log.timestamp))} | ${log.appLabel}] $who: ${log.messageText}"
         }
 
@@ -458,7 +532,7 @@ class JarvisAgentEngine(
             appendLine("Summarize the messages clearly and concisely in the user's language (Hindi/Hinglish/English).")
         }
 
-        val streamRes = geminiApiClient.streamConversationalReply(
+        val streamRes = aiClient.streamConversationalReply(
             rawApiKey = settings.geminiApiKey,
             masterSystemPrompt = settings.masterSystemPrompt,
             userPrompt = prompt,
@@ -561,7 +635,7 @@ class JarvisAgentEngine(
         }
 
         var started = false
-        val streamRes = geminiApiClient.streamConversationalReply(
+        val streamRes = aiClient.streamConversationalReply(
             rawApiKey = settings.geminiApiKey,
             masterSystemPrompt = settings.masterSystemPrompt,
             userPrompt = prompt,
@@ -580,7 +654,7 @@ class JarvisAgentEngine(
         return streamRes.fold(
             onSuccess = { explanation ->
                 AgentExecutionResult(
-                    executedAction = "GEMINI:SCREEN_EXPLAIN",
+                    executedAction = "JARVIS:SCREEN_EXPLAIN",
                     paramsJson = JSONObject().put("package", snapshot.packageName).toString(),
                     reply = explanation,
                     isOffline = false,
@@ -607,8 +681,8 @@ class JarvisAgentEngine(
             "turn on", "turn off", "hotspot", "settings", "youtube", "whatsapp", "instagram",
             "chrome", "maps", "spotify", "camera", "gallery", "message ", "send ", "call ",
             "dial ", "go back", "go home", "screenshot", "lock", "wifi", "wi-fi", "bluetooth",
-            "clipboard", "volume", "brightness", "dnd", "do not disturb", "kholo", "chalao",
-            "bhejo", "dabao", "likho"
+            "clipboard", "volume", "brightness", "dnd", "do not disturb", "kholo", "khol ",
+            "chalao", "bhejo", "dabao", "likho", "on karo", "off karo"
         )
         return deviceActionKeywords.none { lower.contains(it) }
     }
@@ -619,13 +693,18 @@ class JarvisAgentEngine(
             lower.contains(" then ") ||
             lower.contains(" aur ") ||
             lower.contains(" phir ") ||
+            lower.contains(" kar ") ||
             lower.contains(",") ||
             lower.contains("search ") ||
             lower.contains("play ") ||
+            lower.contains("chalao") ||
             lower.contains("hotspot") ||
             lower.contains("turn on") ||
             lower.contains("turn off") ||
+            lower.contains("on karo") ||
+            lower.contains("off karo") ||
             lower.contains("send ") ||
+            lower.contains("bhejo") ||
             lower.contains("message ")
     }
 
@@ -652,7 +731,7 @@ class JarvisAgentEngine(
             val screenJson = if (settings.autoReadScreenContext) {
                 JarvisAccessibilityService.instance?.readScreenHierarchy()?.toCompactJson()
             } else null
-            val res = geminiApiClient.requestAgentAction(
+            val res = aiClient.requestAgentAction(
                 rawApiKey = settings.geminiApiKey,
                 masterSystemPrompt = settings.masterSystemPrompt,
                 userQuery = macro.actionPayload,
@@ -710,7 +789,16 @@ class JarvisAgentEngine(
             "SPEAK", "DONE" -> null
 
             "OPEN_APP" -> {
-                val appName = params.optString("appName", params.optString("app", "")).trim()
+                val pkgName = params.optString("packageName", "").trim()
+                if (pkgName.isNotEmpty()) {
+                    val launchByPkg = appContext.packageManager.getLaunchIntentForPackage(pkgName)?.apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    if (launchByPkg != null && runCatching { appContext.startActivity(launchByPkg) }.isSuccess) {
+                        return null
+                    }
+                }
+                val appName = params.optString("appName", params.optString("app", pkgName)).trim()
                 val launched = offlineProcessor.openInstalledApp(appName)
                 if (launched == null) "App '$appName' not found" else null
             }
@@ -726,7 +814,7 @@ class JarvisAgentEngine(
                 val x = params.optDouble("x", -1.0).toFloat()
                 val y = params.optDouble("y", -1.0).toFloat()
                 if (x < 0f || y < 0f) return "Invalid tap coordinates"
-                if (!service.gestureEngine.tap(x, y)) "Tap gesture cancelled" else null
+                if (!service.tapXY(x, y, durationMs = 80L)) "Tap gesture cancelled" else null
             }
 
             "LONG_PRESS" -> {
@@ -735,13 +823,48 @@ class JarvisAgentEngine(
                 val y = params.optDouble("y", -1.0).toFloat()
                 val duration = params.optLong("durationMs", 750L)
                 if (x < 0f || y < 0f) return "Invalid long-press coordinates"
-                if (!service.gestureEngine.longPress(x, y, duration)) "Long-press cancelled" else null
+                if (!service.longPress(x, y, duration)) "Long-press cancelled" else null
+            }
+
+            "SWIPE" -> {
+                if (service == null) return "Accessibility Service inactive"
+                val x1 = params.optDouble("x1", params.optDouble("startX", 500.0)).toFloat()
+                val y1 = params.optDouble("y1", params.optDouble("startY", 1400.0)).toFloat()
+                val x2 = params.optDouble("x2", params.optDouble("endX", 500.0)).toFloat()
+                val y2 = params.optDouble("y2", params.optDouble("endY", 500.0)).toFloat()
+                val duration = params.optLong("durationMs", 320L)
+                if (!service.swipe(x1, y1, x2, y2, duration)) "Swipe gesture cancelled" else null
+            }
+
+            "SCROLL_DOWN" -> {
+                if (service == null) return "Accessibility Service inactive"
+                if (!service.scrollDown()) "Scroll down cancelled" else null
+            }
+
+            "SCROLL_UP" -> {
+                if (service == null) return "Accessibility Service inactive"
+                if (!service.scrollUp()) "Scroll up cancelled" else null
             }
 
             "SCROLL" -> {
                 if (service == null) return "Accessibility Service inactive"
                 val dir = params.optString("direction", "SCROLL_DOWN")
                 if (!service.performDirectionalScroll(dir)) "Scroll gesture cancelled" else null
+            }
+
+            "BACK" -> {
+                if (service == null) return "Accessibility Service inactive"
+                if (!service.performGlobalSystemAction("BACK")) "Back action failed" else null
+            }
+
+            "HOME" -> {
+                if (service == null) return "Accessibility Service inactive"
+                if (!service.performGlobalSystemAction("HOME")) "Home action failed" else null
+            }
+
+            "RECENTS" -> {
+                if (service == null) return "Accessibility Service inactive"
+                if (!service.performGlobalSystemAction("RECENTS")) "Recents action failed" else null
             }
 
             "DRAG" -> {

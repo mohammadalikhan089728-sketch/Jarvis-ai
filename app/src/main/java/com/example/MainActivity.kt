@@ -3,9 +3,11 @@ package com.example
 import android.Manifest
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.WindowManager
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -91,9 +93,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        if (intent?.getBooleanExtra(FloatingOrbService.EXTRA_START_LISTENING, false) == true) {
-            viewModel.startLiveSession()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
         }
+
+        handleLaunchIntent(intent)
 
         setContent {
             JarvisTheme {
@@ -114,7 +119,22 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        if (intent.getBooleanExtra(FloatingOrbService.EXTRA_START_LISTENING, false)) {
+        handleLaunchIntent(intent)
+    }
+
+    private fun handleLaunchIntent(launchIntent: Intent?) {
+        if (launchIntent == null) return
+        val action = launchIntent.action
+        val initialCommand = launchIntent.getStringExtra(JarvisWakeWordService.EXTRA_INITIAL_COMMAND)?.trim().orEmpty()
+        val shouldStartListening =
+            launchIntent.getBooleanExtra(FloatingOrbService.EXTRA_START_LISTENING, false) ||
+                launchIntent.getBooleanExtra(JarvisWakeWordService.EXTRA_WAKE_TRIGGERED, false) ||
+                action == Intent.ACTION_ASSIST ||
+                action == "android.intent.action.VOICE_ASSIST"
+
+        if (initialCommand.isNotEmpty()) {
+            viewModel.submitCommand(initialCommand)
+        } else if (shouldStartListening) {
             viewModel.startLiveSession()
         }
     }
@@ -146,6 +166,7 @@ private fun JarvisRootApp(
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val history by viewModel.chatHistory.collectAsStateWithLifecycle()
     val macros by viewModel.macros.collectAsStateWithLifecycle()
+    val scheduledCalls by viewModel.scheduledCalls.collectAsStateWithLifecycle()
     val permissions by viewModel.permissionsState.collectAsStateWithLifecycle()
     val keyVerification by viewModel.keyVerificationState.collectAsStateWithLifecycle()
     val screenSummary by viewModel.screenSummary.collectAsStateWithLifecycle()
@@ -153,6 +174,7 @@ private fun JarvisRootApp(
     val multiStepStatus by viewModel.multiStepStatus.collectAsStateWithLifecycle()
     val activeVoiceLabel by viewModel.activeVoiceLabel.collectAsStateWithLifecycle()
     val lastVoiceStatus by viewModel.lastVoiceStatus.collectAsStateWithLifecycle()
+    val wakeWordServiceRunning by viewModel.wakeWordServiceRunning.collectAsStateWithLifecycle()
 
     // Keep screen awake during active continuous live conversation and release on stop
     DisposableEffect(isLiveSessionActive) {
@@ -188,10 +210,22 @@ private fun JarvisRootApp(
         viewModel.refreshPermissions()
     }
 
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) {
+        viewModel.refreshPermissions()
+    }
+
     val phoneContactsLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
         viewModel.refreshPermissions()
+    }
+
+    fun requestNotificationsIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
     }
 
     fun navigateTopLevel(route: String) {
@@ -201,6 +235,19 @@ private fun JarvisRootApp(
             }
             launchSingleTop = true
             restoreState = true
+        }
+    }
+
+    fun openDefaultAssistantSettings() {
+        val primaryIntent = Intent(Settings.ACTION_VOICE_INPUT_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val opened = runCatching { context.startActivity(primaryIntent); true }.getOrDefault(false)
+        if (!opened) {
+            val fallback = Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            runCatching { context.startActivity(fallback) }
         }
     }
 
@@ -236,6 +283,17 @@ private fun JarvisRootApp(
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         runCatching { context.startActivity(intent) }
+    }
+
+    fun runDiagnosticTapWithToast() {
+        viewModel.runDiagnosticTapTest { success ->
+            val message = if (success) {
+                "JARVIS Screen Tap SUCCESS — canPerformGestures is ACTIVE"
+            } else {
+                "Enable JARVIS Accessibility Service first for touch gestures"
+            }
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        }
     }
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
@@ -374,7 +432,9 @@ private fun JarvisRootApp(
                                 onRequestMic = {
                                     micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                 },
+                                onOpenDefaultAssistantSettings = ::openDefaultAssistantSettings,
                                 onOpenAccessibilitySettings = ::openAccessibilitySettings,
+                                onTestScreenTap = ::runDiagnosticTapWithToast,
                                 onOpenNotificationListenerSettings = ::openNotificationListenerSettings,
                                 onOpenAppInfoSettings = ::openAppInfoSettings,
                                 onRequestOverlay = ::openOverlayPermissionSettings,
@@ -402,12 +462,21 @@ private fun JarvisRootApp(
                                 lastVoiceStatus = lastVoiceStatus,
                                 overlayPermissionGranted = permissions.overlayGranted,
                                 notificationListenerGranted = permissions.notificationListenerActive,
+                                wakeWordServiceRunning = wakeWordServiceRunning,
+                                scheduledCalls = scheduledCalls,
                                 onSaveSettings = viewModel::saveSettings,
-                                onVerifyApiKey = viewModel::verifyGeminiApiKey,
+                                onVerifyApiKey = viewModel::verifyAiCoreApiKey,
                                 onResetVerification = viewModel::resetVerificationState,
                                 onTestVoice = viewModel::testVoice,
                                 onRequestOverlayPermission = ::openOverlayPermissionSettings,
-                                onOpenNotificationListenerSettings = ::openNotificationListenerSettings
+                                onOpenNotificationListenerSettings = ::openNotificationListenerSettings,
+                                onOpenDefaultAssistantSettings = ::openDefaultAssistantSettings,
+                                onRequestPostNotificationsPermission = ::requestNotificationsIfNeeded,
+                                onAddScheduledCall = viewModel::addScheduledCall,
+                                onToggleScheduledCall = viewModel::toggleScheduledCallEnabled,
+                                onDeleteScheduledCall = viewModel::deleteScheduledCall,
+                                onTestIncomingCall = viewModel::triggerTestIncomingCall,
+                                onTestScreenTap = ::runDiagnosticTapWithToast
                             )
                         }
                     }

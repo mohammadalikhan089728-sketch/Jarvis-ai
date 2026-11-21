@@ -112,7 +112,7 @@ fun MacrosScreen(
                         color = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "Local Room voice shortcuts & multi-touch tests",
+                        text = "Developed by Mozahid • Local Room shortcuts & gestures",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -333,7 +333,7 @@ private fun CreateMacroDialog(
         "DRAG" -> """{"angleDegrees":45,"distancePx":350}"""
         "MULTI_TOUCH" -> """{"gesture":"PINCH_OUT","spreadPx":260}"""
         "TAP_TEXT" -> "Button label (e.g. Send)"
-        else -> "Complex command for gemini-3.5-flash"
+        else -> "Complex command for JARVIS AI Core"
     }
 
     AlertDialog(

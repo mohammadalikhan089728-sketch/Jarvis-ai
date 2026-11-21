@@ -72,7 +72,6 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.ChatHistoryEntity
-import com.example.GeminiApiClient
 import com.example.JarvisPhase
 import com.example.PermissionsSnapshot
 import com.example.R
@@ -333,12 +332,18 @@ private fun HudTopTelemetryHeader(
                 style = MaterialTheme.typography.headlineSmall,
                 color = MaterialTheme.colorScheme.primary
             )
+            Text(
+                text = stringResource(R.string.developer_credit),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(4.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 TelemetryBadge(
-                    label = GeminiApiClient.MODEL_NAME,
+                    label = if (settings.geminiApiKey.isNotBlank()) "JARVIS CORE" else "CORE KEY NEEDED",
                     color = if (settings.geminiApiKey.isNotBlank()) SignalGreen else StarkAmber
                 )
                 TelemetryBadge(

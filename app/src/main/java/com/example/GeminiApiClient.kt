@@ -1,5 +1,6 @@
 package com.example
 
+import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -16,14 +17,20 @@ data class JarvisAiAction(
     val reply: String
 )
 
+data class AiAudioPayload(
+    val audioBytes: ByteArray,
+    val mimeType: String
+)
+
 sealed interface KeyVerificationResult {
-    data class Valid(val latencyMs: Long, val model: String = GeminiApiClient.MODEL_NAME) : KeyVerificationResult
+    data class Valid(val latencyMs: Long) : KeyVerificationResult
     data class Invalid(val message: String) : KeyVerificationResult
 }
 
 class GeminiApiClient {
 
     companion object {
+        // Strictly locked internal neural engine identifier (never exposed in UI strings)
         const val MODEL_NAME = "gemini-3.5-flash"
         private const val GENERATE_ENDPOINT_URL =
             "https://generativelanguage.googleapis.com/v1beta/models/$MODEL_NAME:generateContent"
@@ -34,14 +41,14 @@ class GeminiApiClient {
 
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(35, TimeUnit.SECONDS)
+        .readTimeout(40, TimeUnit.SECONDS)
         .writeTimeout(12, TimeUnit.SECONDS)
         .build()
 
     suspend fun verifyApiKey(rawApiKey: String): KeyVerificationResult = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
         if (apiKey.isEmpty()) {
-            return@withContext KeyVerificationResult.Invalid("API key is empty. Paste a valid Gemini key.")
+            return@withContext KeyVerificationResult.Invalid("API key is empty. Enter a valid JARVIS AI Core key.")
         }
 
         val startTime = System.currentTimeMillis()
@@ -78,25 +85,128 @@ class GeminiApiClient {
                 if (response.isSuccessful) {
                     KeyVerificationResult.Valid(latencyMs = latency)
                 } else {
-                    val apiError = extractApiErrorMessage(responseBody)
+                    val apiError = sanitizeErrorText(extractApiErrorMessage(responseBody))
                     val friendly = when (response.code) {
-                        400 -> "Bad request (400): ${apiError.ifBlank { "Check API key format." }}"
-                        401, 403 -> "Unauthorized (${response.code}): API key rejected or lacks access to $MODEL_NAME."
-                        404 -> "Model $MODEL_NAME endpoint not found (404): $apiError"
-                        429 -> "Rate limit reached (429): Quota exceeded for $MODEL_NAME."
-                        else -> "HTTP ${response.code}: ${apiError.ifBlank { response.message }}"
+                        400 -> "Invalid request (400): ${apiError.ifBlank { "Check your API key format." }}"
+                        401, 403 -> "Authentication failed (${response.code}): API key rejected."
+                        404 -> "JARVIS AI Core endpoint unavailable (404)."
+                        429 -> "Rate limit reached (429): Quota temporarily exceeded."
+                        else -> "Connection error (${response.code}): ${apiError.ifBlank { response.message }}"
                     }
                     KeyVerificationResult.Invalid(friendly)
                 }
             }
         } catch (e: Exception) {
-            KeyVerificationResult.Invalid("Network error: ${e.localizedMessage ?: "Unable to reach Gemini API."}")
+            KeyVerificationResult.Invalid("Network error: ${e.localizedMessage ?: "Unable to reach JARVIS AI Core."}")
         }
     }
 
     /**
-     * Ultra-fast real-time SSE streaming conversational reply powered strictly by gemini-3.5-flash.
-     * Flushes completed sentences immediately on '.', '?', '!', '।', or newline so TTS starts in ~400ms.
+     * Generates native human-like AI audio bytes (PCM / WAV) via responseModalities: ["AUDIO"]
+     * with selectable male voice ("Charon" or "Fenrir") for "With AI Voice" mode.
+     */
+    suspend fun requestAiVoiceAudio(
+        rawApiKey: String,
+        textToSpeak: String,
+        voiceName: String = AI_VOICE_CHARON
+    ): Result<AiAudioPayload> = withContext(Dispatchers.IO) {
+        val apiKey = rawApiKey.trim()
+        val cleanText = textToSpeak.trim()
+        if (apiKey.isEmpty() || cleanText.isEmpty()) {
+            return@withContext Result.failure(IllegalStateException("AI Voice requires an active API key and text."))
+        }
+
+        val resolvedVoice = if (voiceName == AI_VOICE_FENRIR) AI_VOICE_FENRIR else AI_VOICE_CHARON
+        try {
+            val payload = JSONObject().apply {
+                put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject().apply {
+                            put("role", "user")
+                            put(
+                                "parts",
+                                JSONArray().put(
+                                    JSONObject().put(
+                                        "text",
+                                        "Read the following JARVIS response aloud naturally, clearly, and authoritatively without adding extra words:\n$cleanText"
+                                    )
+                                )
+                            )
+                        }
+                    )
+                )
+                put(
+                    "generationConfig",
+                    JSONObject().apply {
+                        put("responseModalities", JSONArray().put("AUDIO"))
+                        put(
+                            "speechConfig",
+                            JSONObject().apply {
+                                put(
+                                    "voiceConfig",
+                                    JSONObject().apply {
+                                        put(
+                                            "prebuiltVoiceConfig",
+                                            JSONObject().apply {
+                                                put("voiceName", resolvedVoice)
+                                            }
+                                        )
+                                    }
+                                )
+                            }
+                        )
+                    }
+                )
+            }
+
+            val request = Request.Builder()
+                .url(GENERATE_ENDPOINT_URL)
+                .header("x-goog-api-key", apiKey)
+                .header("Content-Type", "application/json")
+                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(
+                        IllegalStateException("AI Voice stream unavailable (${response.code}).")
+                    )
+                }
+
+                val root = JSONObject(body)
+                val candidates = root.optJSONArray("candidates") ?: return@withContext Result.failure(
+                    IllegalStateException("No audio candidate returned.")
+                )
+                for (c in 0 until candidates.length()) {
+                    val parts = candidates.optJSONObject(c)
+                        ?.optJSONObject("content")
+                        ?.optJSONArray("parts") ?: continue
+                    for (p in 0 until parts.length()) {
+                        val inlineData = parts.optJSONObject(p)?.optJSONObject("inlineData") ?: continue
+                        val b64 = inlineData.optString("data", "")
+                        val mime = inlineData.optString("mimeType", "audio/L16;codec=pcm;rate=24000")
+                        if (b64.isNotBlank()) {
+                            val decoded = Base64.decode(b64, Base64.DEFAULT)
+                            if (decoded.isNotEmpty()) {
+                                return@withContext Result.success(
+                                    AiAudioPayload(audioBytes = decoded, mimeType = mime)
+                                )
+                            }
+                        }
+                    }
+                }
+                Result.failure(IllegalStateException("No inline audio payload present in AI Voice response."))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    /**
+     * Ultra-fast real-time SSE streaming conversational reply.
+     * Flushes completed sentences immediately on '.', '?', '!', '।', or newline so Normal Voice starts in ~400ms.
      */
     suspend fun streamConversationalReply(
         rawApiKey: String,
@@ -109,7 +219,7 @@ class GeminiApiClient {
         val apiKey = rawApiKey.trim()
         if (apiKey.isEmpty()) {
             return@withContext Result.failure(
-                IllegalStateException("Gemini API key is not configured. Open Config to enter your key.")
+                IllegalStateException("JARVIS AI Core key is not configured. Open Config to enter your key.")
             )
         }
 
@@ -117,7 +227,8 @@ class GeminiApiClient {
             val systemText = buildString {
                 append(masterSystemPrompt.ifBlank { DEFAULT_MASTER_PROMPT })
                 appendLine()
-                appendLine("STREAMING VOICE OUTPUT RULES:")
+                appendLine("IDENTITY & VOICE OUTPUT RULES:")
+                appendLine("- You are JARVIS, developed by Mozahid. Never mention any external AI brand or model name.")
                 appendLine("- Respond in clean, natural spoken sentences (no markdown bullets, no asterisks, no JSON).")
                 appendLine("- Keep sentences crisp and conversational so real-time voice synthesis sounds immediate.")
                 if (extraSystemGuidance.isNotBlank()) {
@@ -178,14 +289,14 @@ class GeminiApiClient {
             httpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     val body = response.body?.string().orEmpty()
-                    val err = extractApiErrorMessage(body)
+                    val err = sanitizeErrorText(extractApiErrorMessage(body))
                     return@withContext Result.failure(
-                        IllegalStateException("Gemini ($MODEL_NAME) error ${response.code}: ${err.ifBlank { response.message }}")
+                        IllegalStateException("JARVIS AI Core error ${response.code}: ${err.ifBlank { response.message }}")
                     )
                 }
 
                 val source = response.body?.source()
-                    ?: return@withContext Result.failure(IllegalStateException("Empty stream body from $MODEL_NAME."))
+                    ?: return@withContext Result.failure(IllegalStateException("Empty response stream from JARVIS AI Core."))
 
                 while (!source.exhausted()) {
                     val line = source.readUtf8Line() ?: break
@@ -199,7 +310,6 @@ class GeminiApiClient {
                     fullText.append(chunkText)
                     sentenceBuffer.append(chunkText)
 
-                    // Flush any completed sentences immediately for ~400ms TTS start
                     while (true) {
                         val cutIndex = findSentenceBoundary(sentenceBuffer)
                         if (cutIndex < 0) break
@@ -219,7 +329,7 @@ class GeminiApiClient {
 
             val combined = sanitizeSpokenSentence(fullText.toString())
             if (combined.isBlank()) {
-                Result.failure(IllegalStateException("Empty streamed response from $MODEL_NAME."))
+                Result.failure(IllegalStateException("Empty response from JARVIS AI Core."))
             } else {
                 Result.success(combined)
             }
@@ -229,7 +339,7 @@ class GeminiApiClient {
     }
 
     /**
-     * Autonomous multi-step phone agent decision call using gemini-3.5-flash:streamGenerateContent.
+     * Autonomous multi-step phone automation decision call.
      */
     suspend fun requestAgentAction(
         rawApiKey: String,
@@ -244,7 +354,7 @@ class GeminiApiClient {
         val apiKey = rawApiKey.trim()
         if (apiKey.isEmpty()) {
             return@withContext Result.failure(
-                IllegalStateException("Gemini API key is not configured. Open Config to enter your key.")
+                IllegalStateException("JARVIS AI Core key is not configured. Open Config to enter your key.")
             )
         }
 
@@ -252,7 +362,6 @@ class GeminiApiClient {
             val combinedSystemPrompt = buildSystemInstruction(masterSystemPrompt)
             val contentsArray = JSONArray()
 
-            // Attach brief conversational continuity only on step 1
             if (stepIndex == 1) {
                 for (entry in recentHistory.takeLast(3)) {
                     contentsArray.put(
@@ -291,10 +400,10 @@ class GeminiApiClient {
                     stepHistory.forEachIndexed { idx, s -> appendLine("${idx + 1}. $s") }
                 }
                 if (!screenContextJson.isNullOrBlank()) {
-                    appendLine("COMPACT SCREEN UI JSON:")
+                    appendLine("CURRENT SCREEN UI JSON:")
                     appendLine(screenContextJson)
                 } else {
-                    appendLine("SCREEN UI JSON: unavailable (Accessibility Service inactive).")
+                    appendLine("CURRENT SCREEN UI JSON: unavailable (Accessibility Service inactive).")
                 }
             }
 
@@ -316,7 +425,7 @@ class GeminiApiClient {
                 put(
                     "generationConfig",
                     JSONObject().apply {
-                        put("temperature", 0.2)
+                        put("temperature", 0.18)
                         put("responseMimeType", "application/json")
                         put("maxOutputTokens", 384)
                     }
@@ -329,7 +438,7 @@ class GeminiApiClient {
 
             if (rawModelText.isBlank()) {
                 return@withContext Result.failure(
-                    IllegalStateException("Empty response received from $MODEL_NAME.")
+                    IllegalStateException("Empty decision response from JARVIS AI Core.")
                 )
             }
             Result.success(parseActionJson(rawModelText))
@@ -339,8 +448,7 @@ class GeminiApiClient {
     }
 
     /**
-     * Generates a human-like background auto-reply for WhatsApp/Telegram/Instagram/SMS notifications
-     * strictly powered by gemini-3.5-flash:streamGenerateContent.
+     * Generates a natural human-like background auto-reply for WhatsApp/Telegram/Instagram/SMS notifications.
      */
     suspend fun generateAutoChatReply(
         rawApiKey: String,
@@ -352,7 +460,7 @@ class GeminiApiClient {
     ): Result<String> = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
         if (apiKey.isEmpty()) {
-            return@withContext Result.failure(IllegalStateException("Gemini API key missing."))
+            return@withContext Result.failure(IllegalStateException("JARVIS AI Core key missing."))
         }
 
         try {
@@ -363,7 +471,7 @@ class GeminiApiClient {
                 appendLine("- You are replying on the user's behalf in $appLabel to \"$senderName\".")
                 appendLine("- Sound completely natural, warm, concise, and human-like (1-2 short casual sentences max).")
                 appendLine("- Match the sender's language (Hindi, Hinglish, or English) automatically.")
-                appendLine("- Output ONLY the exact message text to send. Do NOT add quotes, prefixes, or explanations.")
+                appendLine("- Output ONLY the exact message text to send. Never mention any AI brand.")
             }
 
             val convoHistory = buildString {
@@ -424,14 +532,14 @@ class GeminiApiClient {
         httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 val body = response.body?.string().orEmpty()
-                val err = extractApiErrorMessage(body)
+                val err = sanitizeErrorText(extractApiErrorMessage(body))
                 return Result.failure(
-                    IllegalStateException("Gemini ($MODEL_NAME) error ${response.code}: ${err.ifBlank { response.message }}")
+                    IllegalStateException("JARVIS AI Core error ${response.code}: ${err.ifBlank { response.message }}")
                 )
             }
 
             val source = response.body?.source()
-                ?: return Result.failure(IllegalStateException("Empty SSE stream from $MODEL_NAME."))
+                ?: return Result.failure(IllegalStateException("Empty response stream from JARVIS AI Core."))
             val sb = StringBuilder()
 
             while (!source.exhausted()) {
@@ -454,7 +562,6 @@ class GeminiApiClient {
                 return i
             }
             if (ch == '.') {
-                // Avoid splitting abbreviations like "J.A.R.V.I.S." or decimals like "3.5"
                 val prevIsDigit = i > 0 && buffer[i - 1].isDigit()
                 val nextIsDigit = i + 1 < buffer.length && buffer[i + 1].isDigit()
                 val nextIsSpaceOrEnd = (i + 1 == buffer.length) || buffer[i + 1].isWhitespace()
@@ -475,33 +582,44 @@ class GeminiApiClient {
             .trim()
     }
 
+    private fun sanitizeErrorText(raw: String): String {
+        return raw.replace(Regex("(?i)gemini[\\w.-]*"), "JARVIS Core").trim()
+    }
+
     private fun buildSystemInstruction(userMasterPrompt: String): String {
         return """
 ${userMasterPrompt.ifBlank { DEFAULT_MASTER_PROMPT }}
 
 CRITICAL AUTONOMOUS MULTI-STEP AGENT PROTOCOL (STRICT JSON ONLY):
+You are JARVIS, developed by Mozahid. Never mention any external AI brand.
 You MUST respond with a single valid JSON object matching this exact schema:
 {
-  "action": "OPEN_APP" | "TAP_TEXT" | "TAP_XY" | "LONG_PRESS" | "TYPE_TEXT" | "SCROLL" | "DRAG" | "MULTI_TOUCH" | "GLOBAL" | "DONE" | "SPEAK",
+  "action": "OPEN_APP" | "TAP_TEXT" | "TAP_XY" | "LONG_PRESS" | "TYPE_TEXT" | "SWIPE" | "SCROLL_DOWN" | "SCROLL_UP" | "SCROLL" | "DRAG" | "MULTI_TOUCH" | "BACK" | "HOME" | "RECENTS" | "GLOBAL" | "DONE" | "SPEAK",
   "params": { ... },
-  "reply": "Short spoken confirmation or status for the user"
+  "reply": "Short spoken confirmation or answer for the user"
 }
 
 MULTI-STEP RULES:
-- Execute ONE immediate next action toward the USER GOAL based on the current COMPACT SCREEN UI JSON (keys: p=package, w=width, h=height, n=nodes with t=text, d=desc, x/y=center coords, c=clickable, e=editable, s=scrollable).
-- For multi-step workflows (e.g., open app -> tap search -> type query -> tap result), do step 1 now; you will automatically be called again with the updated screen after 900ms!
+- Execute ONE immediate next action toward the USER GOAL based on CURRENT SCREEN UI JSON (each node has id, text, desc, x, y, clickable, editable, scrollable).
+- For multi-step goals (e.g., open YouTube -> tap search -> type song with submit:true -> tap first video; or open WhatsApp -> tap contact -> type message -> tap Send; or open Settings -> tap Network/Hotspot -> toggle on), execute the next logical step now. You will automatically receive the updated screen after 900ms!
 - As soon as the user's goal is completely achieved, return "action": "DONE" with a crisp final spoken confirmation in "reply".
-- If the request is purely a question or requires no screen action, return "action": "SPEAK" with the full spoken answer in "reply".
+- If no screen action is needed, return "action": "SPEAK".
 
 PARAMS SPECIFICATION BY ACTION:
-- "OPEN_APP": {"appName": "YouTube"}
+- "OPEN_APP": {"appName": "YouTube", "packageName": "optional.package.name"}
 - "TAP_TEXT": {"text": "visible label or button text"}
 - "TAP_XY": {"x": 540, "y": 1200}
 - "LONG_PRESS": {"x": 540, "y": 1200, "durationMs": 750}
 - "TYPE_TEXT": {"text": "text to enter", "target": "optional field label", "submit": true}
+- "SWIPE": {"x1": 540, "y1": 1600, "x2": 540, "y2": 500, "durationMs": 320}
+- "SCROLL_DOWN": {}
+- "SCROLL_UP": {}
 - "SCROLL": {"direction": "SCROLL_UP" | "SCROLL_DOWN" | "SCROLL_LEFT" | "SCROLL_RIGHT"}
 - "DRAG": {"startX": 300, "startY": 1000, "endX": 800, "endY": 600, "durationMs": 420} OR {"angleDegrees": 45, "distancePx": 400, "durationMs": 420}
 - "MULTI_TOUCH": {"gesture": "PINCH_IN" | "PINCH_OUT" | "ROTATE" | "TWO_FINGER_SWIPE" | "MULTI_TAP", "direction": "UP|DOWN|LEFT|RIGHT", "degrees": 45, "spreadPx": 260, "points": [{"x": 200, "y": 900}, {"x": 880, "y": 900}]}
+- "BACK": {}
+- "HOME": {}
+- "RECENTS": {}
 - "GLOBAL": {"command": "HOME" | "BACK" | "RECENTS" | "NOTIFICATIONS" | "QUICK_SETTINGS" | "SCREENSHOT" | "LOCK_SCREEN" | "FLASHLIGHT_ON" | "FLASHLIGHT_OFF" | "VOLUME_UP" | "VOLUME_DOWN" | "WIFI" | "BLUETOOTH" | "DND" | "CLIPBOARD_READ" | "CLIPBOARD_COPY" | "CALL", "target": "optional text or phone/contact"}
 - "DONE": {}
 - "SPEAK": {}

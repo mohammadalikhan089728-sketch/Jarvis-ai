@@ -2,8 +2,9 @@ package com.example
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.MediaPlayer
-import android.net.Uri
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -17,29 +18,28 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
 import java.io.File
-import java.net.URLEncoder
 import java.util.Locale
 import java.util.UUID
-import java.util.concurrent.TimeUnit
 
-class VoiceEngineManager(private val context: Context) {
+/**
+ * Dual-Mode JARVIS Voice Synthesis Engine (Developed by Mozahid):
+ * 1. "Normal Voice": Fast sentence-by-sentence streaming + Android Neural TextToSpeech.
+ * 2. "With AI Voice": Native human-like AI audio output ("Charon" or "Fenrir") played via AudioTrack / MediaPlayer,
+ *    with automatic seamless fallback to Normal Voice when offline.
+ */
+class VoiceEngineManager(
+    private val context: Context,
+    private val aiClient: GeminiApiClient = GeminiApiClient()
+) {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
-        .build()
 
     private var tts: TextToSpeech? = null
     private var isTtsReady = false
     private var mediaPlayer: MediaPlayer? = null
-    private var customPlaybackJob: Job? = null
+    private var audioTrack: AudioTrack? = null
+    private var aiVoiceJob: Job? = null
 
     @Volatile
     private var activeUtteranceId: String? = null
@@ -54,7 +54,7 @@ class VoiceEngineManager(private val context: Context) {
     private var streamSentencesQueuedCount = 0
     @Volatile
     private var streamLastUtteranceId: String? = null
-    private val customStreamBuffer = StringBuilder()
+    private val aiVoiceStreamBuffer = StringBuilder()
     private var activeStreamSettings: SettingsEntity? = null
 
     private val _isSpeaking = MutableStateFlow(false)
@@ -63,7 +63,7 @@ class VoiceEngineManager(private val context: Context) {
     private val _activeVoiceLabel = MutableStateFlow("Initializing Neural Voice…")
     val activeVoiceLabel: StateFlow<String> = _activeVoiceLabel.asStateFlow()
 
-    private val _lastVoiceStatus = MutableStateFlow("Voice engine ready")
+    private val _lastVoiceStatus = MutableStateFlow("Normal Voice ready")
     val lastVoiceStatus: StateFlow<String> = _lastVoiceStatus.asStateFlow()
 
     init {
@@ -110,7 +110,7 @@ class VoiceEngineManager(private val context: Context) {
 
         if (voices.isEmpty()) {
             engine.language = Locale.UK
-            _activeVoiceLabel.value = "System English (UK)"
+            _activeVoiceLabel.value = "Neural English (UK)"
             return
         }
 
@@ -129,7 +129,7 @@ class VoiceEngineManager(private val context: Context) {
             _activeVoiceLabel.value = "${best.locale.displayName} ($qualityTag)"
         } else {
             engine.language = Locale.UK
-            _activeVoiceLabel.value = "System English (UK)"
+            _activeVoiceLabel.value = "Neural English (UK)"
         }
     }
 
@@ -220,7 +220,7 @@ class VoiceEngineManager(private val context: Context) {
         streamLastUtteranceId = null
         activeUtteranceId = null
         activeStreamSettings = null
-        customStreamBuffer.clear()
+        aiVoiceStreamBuffer.clear()
         _isSpeaking.value = false
         val cb = onSpeechFinishedCallback
         onSpeechFinishedCallback = null
@@ -240,10 +240,14 @@ class VoiceEngineManager(private val context: Context) {
         }
     }
 
+    private fun isAiVoiceMode(settings: SettingsEntity): Boolean {
+        return settings.voiceMode == VOICE_MODE_AI_VOICE && settings.geminiApiKey.isNotBlank()
+    }
+
     /**
-     * Begins a zero-lag sentence-by-sentence streaming TTS session.
-     * Call [enqueueStreamSentence] for each sentence arriving from gemini-3.5-flash SSE,
-     * then call [finishStreamingSpeech] when the stream closes.
+     * Begins a zero-lag sentence-by-sentence streaming speech session.
+     * In "Normal Voice" mode, sentences speak immediately via TextToSpeech.QUEUE_ADD (~400ms start).
+     * In "With AI Voice" mode, accumulates streamed sentences cleanly and renders native AI audio.
      */
     fun beginStreamingSpeech(
         settings: SettingsEntity,
@@ -256,22 +260,17 @@ class VoiceEngineManager(private val context: Context) {
         streamInputFinished = false
         streamSentencesQueuedCount = 0
         streamLastUtteranceId = null
-        customStreamBuffer.clear()
+        aiVoiceStreamBuffer.clear()
     }
 
-    /**
-     * Feeds a completed sentence immediately into Android TTS using TextToSpeech.QUEUE_ADD
-     * (after flushing on the very first sentence) so JARVIS speaks within ~400ms.
-     */
     fun enqueueStreamSentence(sentence: String) {
         val clean = sentence.trim()
         val settings = activeStreamSettings ?: return
         if (clean.isEmpty() || !isStreamingSessionOpen) return
 
-        if (settings.voiceMode == VOICE_MODE_CUSTOM_URL && settings.customVoiceUrl.isNotBlank()) {
-            // Buffer for custom HTTP audio endpoint playback once stream finishes cleanly
-            if (customStreamBuffer.isNotEmpty()) customStreamBuffer.append(' ')
-            customStreamBuffer.append(clean)
+        if (isAiVoiceMode(settings)) {
+            if (aiVoiceStreamBuffer.isNotEmpty()) aiVoiceStreamBuffer.append(' ')
+            aiVoiceStreamBuffer.append(clean)
             return
         }
 
@@ -282,7 +281,7 @@ class VoiceEngineManager(private val context: Context) {
         if (isFirst) {
             engine.setPitch(settings.voicePitch.coerceIn(0.55f, 1.5f))
             engine.setSpeechRate(settings.voiceSpeed.coerceIn(0.6f, 1.75f))
-            _lastVoiceStatus.value = "Streaming Neural Voice (${_activeVoiceLabel.value})"
+            _lastVoiceStatus.value = "Normal Voice active (${_activeVoiceLabel.value})"
         }
 
         val params = Bundle().apply {
@@ -301,25 +300,17 @@ class VoiceEngineManager(private val context: Context) {
         }
     }
 
-    /**
-     * Signals that no more sentences will arrive in the current stream.
-     * Fires [onAllFinished] once the final queued sentence finishes speaking.
-     */
     fun finishStreamingSpeech() {
         scope.launch {
             if (!isStreamingSessionOpen) return@launch
             val settings = activeStreamSettings
 
-            if (settings != null &&
-                settings.voiceMode == VOICE_MODE_CUSTOM_URL &&
-                settings.customVoiceUrl.isNotBlank() &&
-                customStreamBuffer.isNotEmpty()
-            ) {
-                val fullText = customStreamBuffer.toString().trim()
+            if (settings != null && isAiVoiceMode(settings) && aiVoiceStreamBuffer.isNotEmpty()) {
+                val fullText = aiVoiceStreamBuffer.toString().trim()
                 val cb = onSpeechFinishedCallback
                 isStreamingSessionOpen = false
                 streamInputFinished = false
-                customStreamBuffer.clear()
+                aiVoiceStreamBuffer.clear()
                 activeStreamSettings = null
                 speak(fullText, settings, cb)
                 return@launch
@@ -351,22 +342,24 @@ class VoiceEngineManager(private val context: Context) {
         stop()
         onSpeechFinishedCallback = onComplete
 
-        if (settings.voiceMode == VOICE_MODE_CUSTOM_URL && settings.customVoiceUrl.isNotBlank()) {
-            customPlaybackJob = scope.launch {
-                val customSuccess = trySpeakCustomEndpoint(cleanText, settings)
-                if (!customSuccess) {
-                    _lastVoiceStatus.value = "Custom voice URL unreachable; fell back to Default Neural Voice."
+        if (isAiVoiceMode(settings)) {
+            _isSpeaking.value = true
+            _lastVoiceStatus.value = "With AI Voice active (${settings.aiVoiceName})"
+            aiVoiceJob = scope.launch {
+                val played = trySpeakNativeAiVoice(cleanText, settings)
+                if (!played) {
+                    _lastVoiceStatus.value = "With AI Voice offline — switched to Normal Voice"
                     speakWithSystemTts(cleanText, settings.voicePitch, settings.voiceSpeed)
                 }
             }
         } else {
-            _lastVoiceStatus.value = "Default Realistic Voice active (${_activeVoiceLabel.value})"
+            _lastVoiceStatus.value = "Normal Voice active (${_activeVoiceLabel.value})"
             speakWithSystemTts(cleanText, settings.voicePitch, settings.voiceSpeed)
         }
     }
 
     fun testVoice(settings: SettingsEntity) {
-        val sample = "All systems operational, sir. Jarvis vocal matrix calibrated and standing by."
+        val sample = "All systems operational, sir. JARVIS, developed by Mozahid, is online and at your command."
         speak(sample, settings)
     }
 
@@ -390,98 +383,91 @@ class VoiceEngineManager(private val context: Context) {
         }
     }
 
-    private suspend fun trySpeakCustomEndpoint(text: String, settings: SettingsEntity): Boolean {
-        val rawUrl = settings.customVoiceUrl.trim()
-        val parsed = runCatching { Uri.parse(rawUrl) }.getOrNull() ?: return false
-        val scheme = parsed.scheme?.lowercase(Locale.ROOT)
-        if (scheme != "http" && scheme != "https") {
-            _lastVoiceStatus.value = "Invalid URL scheme. Only http:// or https:// endpoints are supported."
-            return false
-        }
-        if (parsed.host.isNullOrBlank()) {
-            _lastVoiceStatus.value = "Invalid custom voice URL host."
-            return false
-        }
+    private suspend fun trySpeakNativeAiVoice(text: String, settings: SettingsEntity): Boolean {
+        val audioResult = aiClient.requestAiVoiceAudio(
+            rawApiKey = settings.geminiApiKey,
+            textToSpeak = text,
+            voiceName = settings.aiVoiceName
+        )
+        val payload = audioResult.getOrNull() ?: return false
+        val mime = payload.mimeType.lowercase(Locale.ROOT)
 
-        if (rawUrl.lowercase(Locale.ROOT).endsWith(".onnx")) {
-            _lastVoiceStatus.value = "ONNX model link saved; point to a Piper/Sherpa HTTP TTS server for direct audio synthesis. Using Default Neural Voice."
-            return false
+        return if (mime.contains("l16") || mime.contains("pcm")) {
+            val sampleRate = parsePcmSampleRate(mime)
+            playPcmWithAudioTrack(payload.audioBytes, sampleRate)
+        } else {
+            playEncodedAudioWithMediaPlayer(payload.audioBytes)
         }
-
-        val audioFile = withContext(Dispatchers.IO) {
-            fetchCustomTtsAudio(rawUrl, text, settings.voiceSpeed, settings.voicePitch)
-        } ?: return false
-
-        return playAudioFile(audioFile)
     }
 
-    private fun fetchCustomTtsAudio(
-        endpointUrl: String,
-        text: String,
-        speed: Float,
-        pitch: Float
-    ): File? {
-        val maxAudioBytes = 10 * 1024 * 1024
-        return try {
-            val request = if (endpointUrl.contains("{text}")) {
-                val encoded = URLEncoder.encode(text, "UTF-8")
-                val finalUrl = endpointUrl.replace("{text}", encoded)
-                Request.Builder().url(finalUrl).get().build()
-            } else {
-                val payload = JSONObject().apply {
-                    put("text", text)
-                    put("input", text)
-                    put("speed", speed.toDouble())
-                    put("pitch", pitch.toDouble())
-                    put("format", "wav")
-                }
-                Request.Builder()
-                    .url(endpointUrl)
-                    .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-                    .header("Accept", "audio/wav, audio/mpeg, audio/ogg, audio/*")
-                    .build()
-            }
+    private fun parsePcmSampleRate(mimeType: String): Int {
+        val match = Regex("rate=(\\d+)").find(mimeType)
+        return match?.groupValues?.getOrNull(1)?.toIntOrNull()?.coerceIn(8000, 48000) ?: 24000
+    }
 
-            httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    if (response.code == 405 && !endpointUrl.contains("{text}")) {
-                        val separator = if (endpointUrl.contains("?")) "&" else "?"
-                        val encoded = URLEncoder.encode(text, "UTF-8")
-                        val getReq = Request.Builder()
-                            .url("${endpointUrl}${separator}text=$encoded")
-                            .get()
+    private suspend fun playPcmWithAudioTrack(pcmBytes: ByteArray, sampleRateHz: Int): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                releaseAudioOutputs()
+                val minBuf = AudioTrack.getMinBufferSize(
+                    sampleRateHz,
+                    AudioFormat.CHANNEL_OUT_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT
+                ).coerceAtLeast(4096)
+
+                val track = AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build()
-                        return httpClient.newCall(getReq).execute().use { getResp ->
-                            saveValidatedAudioBody(getResp, maxAudioBytes)
-                        }
-                    }
-                    return null
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(sampleRateHz)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(maxOf(minBuf, pcmBytes.size.coerceAtMost(131_072)))
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
+
+                audioTrack = track
+                _isSpeaking.value = true
+                track.play()
+
+                var offset = 0
+                val chunkSize = 4096
+                while (offset < pcmBytes.size && audioTrack === track) {
+                    val toWrite = minOf(chunkSize, pcmBytes.size - offset)
+                    val written = track.write(pcmBytes, offset, toWrite)
+                    if (written <= 0) break
+                    offset += written
                 }
-                saveValidatedAudioBody(response, maxAudioBytes)
+
+                runCatching {
+                    track.stop()
+                    track.release()
+                }
+                if (audioTrack === track) {
+                    audioTrack = null
+                }
+                dispatchSpeechFinished(expectedUtteranceId = null)
+                true
+            } catch (_: Exception) {
+                releaseAudioOutputs()
+                false
             }
-        } catch (_: Exception) {
-            null
         }
     }
 
-    private fun saveValidatedAudioBody(response: okhttp3.Response, maxAudioBytes: Int): File? {
-        if (!response.isSuccessful) return null
-        val contentType = response.header("Content-Type")?.lowercase(Locale.ROOT).orEmpty()
-        if (contentType.startsWith("text/html") || contentType.startsWith("application/json")) {
-            return null
-        }
-        val body = response.body ?: return null
-        val bytes = body.bytes()
-        if (bytes.isEmpty() || bytes.size > maxAudioBytes) return null
-
-        val outFile = File(context.cacheDir, "jarvis_custom_tts.audio")
-        outFile.writeBytes(bytes)
-        return outFile
-    }
-
-    private fun playAudioFile(file: File): Boolean {
+    private fun playEncodedAudioWithMediaPlayer(bytes: ByteArray): Boolean {
         return try {
-            releaseMediaPlayer()
+            releaseAudioOutputs()
+            val outFile = File(context.cacheDir, "jarvis_ai_voice.audio")
+            outFile.writeBytes(bytes)
+
             val player = MediaPlayer().apply {
                 setAudioAttributes(
                     AudioAttributes.Builder()
@@ -489,13 +475,13 @@ class VoiceEngineManager(private val context: Context) {
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                 )
-                setDataSource(file.absolutePath)
+                setDataSource(outFile.absolutePath)
                 setOnCompletionListener {
-                    releaseMediaPlayer()
+                    releaseAudioOutputs()
                     dispatchSpeechFinished(expectedUtteranceId = null)
                 }
                 setOnErrorListener { _, _, _ ->
-                    releaseMediaPlayer()
+                    releaseAudioOutputs()
                     dispatchSpeechFinished(expectedUtteranceId = null)
                     true
                 }
@@ -505,15 +491,14 @@ class VoiceEngineManager(private val context: Context) {
             mediaPlayer = player
             activeUtteranceId = null
             _isSpeaking.value = true
-            _lastVoiceStatus.value = "Streaming custom open-source voice audio."
             true
         } catch (_: Exception) {
-            releaseMediaPlayer()
+            releaseAudioOutputs()
             false
         }
     }
 
-    private fun releaseMediaPlayer() {
+    private fun releaseAudioOutputs() {
         mediaPlayer?.let { player ->
             runCatching {
                 if (player.isPlaying) player.stop()
@@ -521,21 +506,31 @@ class VoiceEngineManager(private val context: Context) {
             }
         }
         mediaPlayer = null
+
+        audioTrack?.let { track ->
+            runCatching {
+                track.pause()
+                track.flush()
+                track.stop()
+                track.release()
+            }
+        }
+        audioTrack = null
     }
 
     fun stop() {
-        customPlaybackJob?.cancel()
-        customPlaybackJob = null
+        aiVoiceJob?.cancel()
+        aiVoiceJob = null
         isStreamingSessionOpen = false
         streamInputFinished = false
         streamSentencesQueuedCount = 0
         streamLastUtteranceId = null
         activeStreamSettings = null
-        customStreamBuffer.clear()
+        aiVoiceStreamBuffer.clear()
         activeUtteranceId = null
         onSpeechFinishedCallback = null
         tts?.stop()
-        releaseMediaPlayer()
+        releaseAudioOutputs()
         _isSpeaking.value = false
     }
 

@@ -4,6 +4,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,22 +19,33 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AddAlert
+import androidx.compose.material.icons.filled.Assistant
+import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.PhoneInTalk
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -47,10 +60,14 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TimeInput
+import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -69,8 +86,20 @@ import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.SignalCrimson
 import com.example.ui.theme.SignalGreen
 import com.example.ui.theme.StarkAmber
+import java.util.Calendar
 import java.util.Locale
 
+private val WEEKDAY_OPTIONS = listOf(
+    Calendar.SUNDAY to "Sun",
+    Calendar.MONDAY to "Mon",
+    Calendar.TUESDAY to "Tue",
+    Calendar.WEDNESDAY to "Wed",
+    Calendar.THURSDAY to "Thu",
+    Calendar.FRIDAY to "Fri",
+    Calendar.SATURDAY to "Sat"
+)
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(
     settings: SettingsEntity,
@@ -79,38 +108,60 @@ fun SettingsScreen(
     lastVoiceStatus: String,
     overlayPermissionGranted: Boolean,
     notificationListenerGranted: Boolean,
+    wakeWordServiceRunning: Boolean,
+    scheduledCalls: List<ScheduledCallEntity>,
     onSaveSettings: (SettingsEntity) -> Unit,
     onVerifyApiKey: (String) -> Unit,
     onResetVerification: () -> Unit,
     onTestVoice: (SettingsEntity) -> Unit,
     onRequestOverlayPermission: () -> Unit,
     onOpenNotificationListenerSettings: () -> Unit,
+    onOpenDefaultAssistantSettings: () -> Unit,
+    onRequestPostNotificationsPermission: () -> Unit,
+    onAddScheduledCall: (hour: Int, minute: Int, purpose: String, actionType: String, repeatDaysCsv: String) -> Unit,
+    onToggleScheduledCall: (ScheduledCallEntity, Boolean) -> Unit,
+    onDeleteScheduledCall: (ScheduledCallEntity) -> Unit,
+    onTestIncomingCall: () -> Unit,
+    onTestScreenTap: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val normalizedInitialMode = if (settings.voiceMode == VOICE_MODE_AI_VOICE) {
+        VOICE_MODE_AI_VOICE
+    } else {
+        VOICE_MODE_NORMAL
+    }
+
     var apiKey by rememberSaveable { mutableStateOf(settings.geminiApiKey) }
     var showApiKey by rememberSaveable { mutableStateOf(false) }
     var masterPrompt by rememberSaveable { mutableStateOf(settings.masterSystemPrompt) }
-    var voiceMode by rememberSaveable { mutableStateOf(settings.voiceMode) }
-    var customVoiceUrl by rememberSaveable { mutableStateOf(settings.customVoiceUrl) }
+    var voiceMode by rememberSaveable { mutableStateOf(normalizedInitialMode) }
+    var aiVoiceName by rememberSaveable { mutableStateOf(settings.aiVoiceName.ifBlank { AI_VOICE_CHARON }) }
     var voicePitch by rememberSaveable { mutableFloatStateOf(settings.voicePitch) }
     var voiceSpeed by rememberSaveable { mutableFloatStateOf(settings.voiceSpeed) }
     var wakeWordEnabled by rememberSaveable { mutableStateOf(settings.wakeWordEnabled) }
+    var customWakeWord by rememberSaveable { mutableStateOf(settings.customWakeWord.ifBlank { "Jarvis" }) }
+    var alwaysOnWakeWord by rememberSaveable { mutableStateOf(settings.alwaysOnWakeWordEnabled) }
+    var onlineAutoCallEnabled by rememberSaveable { mutableStateOf(settings.onlineAutoCallEnabled) }
     var autoReadScreen by rememberSaveable { mutableStateOf(settings.autoReadScreenContext) }
     var floatingOverlay by rememberSaveable { mutableStateOf(settings.floatingOverlayEnabled) }
     var offlineFirst by rememberSaveable { mutableStateOf(settings.offlineFirstMode) }
     var autoReplyEnabled by rememberSaveable { mutableStateOf(settings.autoReplyEnabled) }
     var autoReplyTargetContact by rememberSaveable { mutableStateOf(settings.autoReplyTargetContact) }
     var savedBanner by remember { mutableStateOf<String?>(null) }
+    var showScheduleDialog by remember { mutableStateOf(false) }
 
-    // Synchronize local form fields when Room initially emits saved values
+    // Synchronize local form fields when Room emits saved updates
     LaunchedEffect(settings.updatedAt) {
         apiKey = settings.geminiApiKey
         masterPrompt = settings.masterSystemPrompt
-        voiceMode = settings.voiceMode
-        customVoiceUrl = settings.customVoiceUrl
+        voiceMode = if (settings.voiceMode == VOICE_MODE_AI_VOICE) VOICE_MODE_AI_VOICE else VOICE_MODE_NORMAL
+        aiVoiceName = settings.aiVoiceName.ifBlank { AI_VOICE_CHARON }
         voicePitch = settings.voicePitch
         voiceSpeed = settings.voiceSpeed
         wakeWordEnabled = settings.wakeWordEnabled
+        customWakeWord = settings.customWakeWord.ifBlank { "Jarvis" }
+        alwaysOnWakeWord = settings.alwaysOnWakeWordEnabled
+        onlineAutoCallEnabled = settings.onlineAutoCallEnabled
         autoReadScreen = settings.autoReadScreenContext
         floatingOverlay = settings.floatingOverlayEnabled
         offlineFirst = settings.offlineFirstMode
@@ -124,7 +175,7 @@ fun SettingsScreen(
             geminiApiKey = apiKey.trim(),
             masterSystemPrompt = masterPrompt.trim().ifBlank { DEFAULT_MASTER_PROMPT },
             voiceMode = voiceMode,
-            customVoiceUrl = customVoiceUrl.trim(),
+            customVoiceUrl = settings.customVoiceUrl,
             voicePitch = voicePitch,
             voiceSpeed = voiceSpeed,
             wakeWordEnabled = wakeWordEnabled,
@@ -132,7 +183,23 @@ fun SettingsScreen(
             floatingOverlayEnabled = floatingOverlay,
             offlineFirstMode = offlineFirst,
             autoReplyEnabled = autoReplyEnabled,
-            autoReplyTargetContact = autoReplyTargetContact.trim()
+            autoReplyTargetContact = autoReplyTargetContact.trim(),
+            customWakeWord = customWakeWord.trim().ifBlank { "Jarvis" },
+            alwaysOnWakeWordEnabled = alwaysOnWakeWord,
+            aiVoiceName = aiVoiceName.ifBlank { AI_VOICE_CHARON },
+            onlineAutoCallEnabled = onlineAutoCallEnabled
+        )
+    }
+
+    if (showScheduleDialog) {
+        ScheduleCallDialog(
+            onDismiss = { showScheduleDialog = false },
+            onConfirm = { hour, minute, purpose, actionType, repeatCsv ->
+                onRequestPostNotificationsPermission()
+                onAddScheduledCall(hour, minute, purpose, actionType, repeatCsv)
+                showScheduleDialog = false
+                savedBanner = "Scheduled JARVIS call for ${CallAlarmScheduler.formatTime12Hour(hour, minute)}."
+            }
         )
     }
 
@@ -156,14 +223,14 @@ fun SettingsScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "SYSTEM CONFIGURATION",
+                        text = "JARVIS CONFIGURATION",
                         style = MaterialTheme.typography.headlineSmall,
                         color = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "100% Local On-Device Room Vault",
+                        text = "Developed by Mozahid • 100% Local Room Vault",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -172,7 +239,7 @@ fun SettingsScreen(
                     onClick = {
                         val entity = buildCurrentEntity()
                         onSaveSettings(entity)
-                        savedBanner = "All parameters saved locally."
+                        savedBanner = "All JARVIS parameters saved locally."
                     },
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.primary,
@@ -202,210 +269,199 @@ fun SettingsScreen(
                 }
             }
 
-            // 1. Gemini API Key Section (Locked strictly to gemini-3.5-flash)
+            // 1. Default Digital Assistant & Screen Touch Control Diagnostics
             SettingsSectionCard(
-                title = "GEMINI NEURAL CORE",
-                icon = Icons.Filled.Key
-            ) {
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = ArcCyan.copy(alpha = 0.12f),
-                    border = BorderStroke(1.dp, ArcCyan.copy(alpha = 0.45f))
-                ) {
-                    Text(
-                        text = "MODEL LOCK: ${GeminiApiClient.MODEL_NAME}",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = ArcCyan,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                OutlinedTextField(
-                    value = apiKey,
-                    onValueChange = {
-                        apiKey = it
-                        onResetVerification()
-                    },
-                    label = { Text("Gemini API Key") },
-                    placeholder = { Text("Paste your AI Studio API key") },
-                    singleLine = true,
-                    visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
-                    trailingIcon = {
-                        IconButton(
-                            onClick = { showApiKey = !showApiKey },
-                            modifier = Modifier.testTag("toggle_api_key_visibility")
-                        ) {
-                            Icon(
-                                imageVector = if (showApiKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                contentDescription = stringResource(R.string.cd_toggle_key_visibility)
-                            )
-                        }
-                    },
-                    colors = hudTextFieldColors(),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("gemini_api_key_input")
-                )
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        onClick = {
-                            onSaveSettings(buildCurrentEntity())
-                            onVerifyApiKey(apiKey)
-                        },
-                        enabled = keyVerificationState !is KeyVerificationUiState.Verifying,
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("verify_api_key_button")
-                    ) {
-                        if (keyVerificationState is KeyVerificationUiState.Verifying) {
-                            CircularProgressIndicator(
-                                strokeWidth = 2.dp,
-                                color = ObsidianVoid,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("VERIFYING…")
-                        } else {
-                            Text("VERIFY KEY")
-                        }
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            apiKey = ""
-                            onResetVerification()
-                            onSaveSettings(buildCurrentEntity())
-                            savedBanner = "API key cleared from local storage."
-                        },
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                        modifier = Modifier.testTag("clear_api_key_button")
-                    ) {
-                        Text("CLEAR")
-                    }
-                }
-
-                when (keyVerificationState) {
-                    is KeyVerificationUiState.Verified -> {
-                        Spacer(modifier = Modifier.height(10.dp))
-                        VerificationBanner(
-                            icon = Icons.Filled.CheckCircle,
-                            color = SignalGreen,
-                            message = "Verified on ${GeminiApiClient.MODEL_NAME} (${keyVerificationState.latencyMs}ms)"
-                        )
-                    }
-                    is KeyVerificationUiState.Failed -> {
-                        Spacer(modifier = Modifier.height(10.dp))
-                        VerificationBanner(
-                            icon = Icons.Filled.ErrorOutline,
-                            color = SignalCrimson,
-                            message = keyVerificationState.reason
-                        )
-                    }
-                    else -> Unit
-                }
-            }
-
-            // 2. Editable Master System Prompt
-            SettingsSectionCard(
-                title = "MASTER SYSTEM PROMPT",
-                icon = Icons.Filled.Psychology
+                title = "SYSTEM ASSISTANT & TOUCH ENGINE",
+                icon = Icons.Filled.Assistant
             ) {
                 Text(
-                    text = "Injected dynamically as systemInstruction into every ${GeminiApiClient.MODEL_NAME} request. Define personality, Hindi/Hinglish/English style, and command priorities.",
+                    text = "Register JARVIS as Android's official Default Digital Assistant so power-button hold or corner swipe launches JARVIS directly.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(10.dp))
-
-                OutlinedTextField(
-                    value = masterPrompt,
-                    onValueChange = { masterPrompt = it },
-                    label = { Text("JARVIS Core Directive") },
-                    minLines = 7,
-                    maxLines = 14,
-                    colors = hudTextFieldColors(),
+                Button(
+                    onClick = onOpenDefaultAssistantSettings,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ArcCyan,
+                        contentColor = ObsidianVoid
+                    ),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("master_prompt_input")
-                )
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        .testTag("set_default_digital_assistant_button")
                 ) {
-                    Button(
-                        onClick = {
-                            onSaveSettings(buildCurrentEntity())
-                            savedBanner = "Master System Prompt updated."
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("save_master_prompt_button")
-                    ) {
-                        Icon(Icons.Filled.Save, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("SAVE PROMPT")
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            masterPrompt = DEFAULT_MASTER_PROMPT
-                            onSaveSettings(buildCurrentEntity())
-                            savedBanner = "Master System Prompt reset to Stark defaults."
-                        },
-                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                        modifier = Modifier.testTag("reset_master_prompt_button")
-                    ) {
-                        Icon(Icons.Filled.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("RESET")
-                    }
+                    Icon(Icons.Filled.Assistant, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("SET JARVIS AS DEFAULT DIGITAL ASSISTANT")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onTestScreenTap,
+                    border = BorderStroke(1.dp, ArcCyan.copy(alpha = 0.7f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("settings_test_screen_tap_button")
+                ) {
+                    Icon(
+                        Icons.Filled.TouchApp,
+                        contentDescription = null,
+                        tint = ArcCyan,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("TEST SCREEN TAP (GESTURE CHECK)", color = ArcCyan)
                 }
             }
 
-            // 3. Realistic Voice Engine Switcher + Sliders + Open-Source Voice URL
+            // 2. Always-On Background Wake Word Detection
             SettingsSectionCard(
-                title = "VOCAL SYNTHESIS MATRIX",
+                title = "ALWAYS-ON BACKGROUND WAKE WORD",
+                icon = Icons.Filled.Hearing
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = (if (wakeWordServiceRunning) SignalGreen else StarkAmber).copy(alpha = 0.14f),
+                        border = BorderStroke(
+                            1.dp,
+                            (if (wakeWordServiceRunning) SignalGreen else StarkAmber).copy(alpha = 0.55f)
+                        )
+                    ) {
+                        Text(
+                            text = if (wakeWordServiceRunning) {
+                                "BACKGROUND ENGINE: ACTIVE"
+                            } else {
+                                "BACKGROUND ENGINE: STANDBY"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            color = if (wakeWordServiceRunning) SignalGreen else StarkAmber,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                BehaviorToggleRow(
+                    title = "Always-On Wake Word (Works When App is Closed)",
+                    subtitle = "Runs a sticky foreground microphone service that wakes JARVIS even when killed from recents or screen is locked",
+                    checked = alwaysOnWakeWord,
+                    onCheckedChange = { enable ->
+                        if (enable) onRequestPostNotificationsPermission()
+                        alwaysOnWakeWord = enable
+                        onSaveSettings(buildCurrentEntity())
+                        savedBanner = if (enable) {
+                            "Always-On background wake word enabled for \"${customWakeWord.ifBlank { "Jarvis" }}\"."
+                        } else {
+                            "Always-On background wake word turned off."
+                        }
+                    },
+                    tag = "toggle_always_on_wake_word"
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                OutlinedTextField(
+                    value = customWakeWord,
+                    onValueChange = { customWakeWord = it },
+                    label = { Text("Custom Wake Word") },
+                    placeholder = { Text("Jarvis, Hey Jarvis, Babua, Sun Jarvis…") },
+                    singleLine = true,
+                    colors = hudTextFieldColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("custom_wake_word_input")
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = {
+                        onSaveSettings(buildCurrentEntity())
+                        savedBanner = "Custom wake word set to \"${customWakeWord.trim().ifBlank { "Jarvis" }}\"."
+                    },
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("save_wake_word_button")
+                ) {
+                    Text("APPLY WAKE WORD")
+                }
+            }
+
+            // 3. Two Clean Voice Modes: Normal Voice vs With AI Voice
+            SettingsSectionCard(
+                title = "JARVIS VOICE MODES",
                 icon = Icons.Filled.GraphicEq
             ) {
                 VoiceOptionRow(
-                    title = "Default Realistic Neural Voice",
-                    subtitle = "Active: $activeVoiceLabel",
-                    selected = voiceMode == VOICE_MODE_DEFAULT,
-                    onSelect = { voiceMode = VOICE_MODE_DEFAULT },
-                    tag = "voice_mode_default_radio"
+                    title = "Normal Voice",
+                    subtitle = "Fast sentence-by-sentence streaming + Android Neural Speech ($activeVoiceLabel) • Saves API quota",
+                    selected = voiceMode == VOICE_MODE_NORMAL,
+                    onSelect = {
+                        voiceMode = VOICE_MODE_NORMAL
+                        onSaveSettings(buildCurrentEntity())
+                    },
+                    tag = "voice_mode_normal_radio"
                 )
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
                 VoiceOptionRow(
-                    title = "Custom Open-Source Voice URL",
-                    subtitle = "Piper TTS / Sherpa-ONNX / HTTP WAV or MP3 endpoint (auto-falls back offline)",
-                    selected = voiceMode == VOICE_MODE_CUSTOM_URL,
-                    onSelect = { voiceMode = VOICE_MODE_CUSTOM_URL },
-                    tag = "voice_mode_custom_radio"
+                    title = "With AI Voice",
+                    subtitle = "Ultra-realistic native AI male voice • Automatically falls back to Normal Voice when offline",
+                    selected = voiceMode == VOICE_MODE_AI_VOICE,
+                    onSelect = {
+                        voiceMode = VOICE_MODE_AI_VOICE
+                        onSaveSettings(buildCurrentEntity())
+                    },
+                    tag = "voice_mode_ai_radio"
                 )
 
-                if (voiceMode == VOICE_MODE_CUSTOM_URL) {
+                if (voiceMode == VOICE_MODE_AI_VOICE) {
                     Spacer(modifier = Modifier.height(10.dp))
-                    OutlinedTextField(
-                        value = customVoiceUrl,
-                        onValueChange = { customVoiceUrl = it },
-                        label = { Text("Open-Source TTS Endpoint / Model URL") },
-                        placeholder = { Text("http://192.168.1.10:5000/api/tts or https://…") },
-                        singleLine = true,
-                        colors = hudTextFieldColors(),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("custom_voice_url_input")
+                    Text(
+                        text = "SELECT AI MALE VOICE PROFILE",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = ArcCyan
                     )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = aiVoiceName == AI_VOICE_CHARON,
+                            onClick = {
+                                aiVoiceName = AI_VOICE_CHARON
+                                onSaveSettings(buildCurrentEntity())
+                            },
+                            label = { Text("Charon (Deep)") },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = ArcCyan.copy(alpha = 0.22f),
+                                selectedLabelColor = ArcCyan
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("ai_voice_charon_chip")
+                        )
+                        FilterChip(
+                            selected = aiVoiceName == AI_VOICE_FENRIR,
+                            onClick = {
+                                aiVoiceName = AI_VOICE_FENRIR
+                                onSaveSettings(buildCurrentEntity())
+                            },
+                            label = { Text("Fenrir (Crisp)") },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = ArcCyan.copy(alpha = 0.22f),
+                                selectedLabelColor = ArcCyan
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("ai_voice_fenrir_chip")
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(14.dp))
@@ -484,14 +540,279 @@ fun SettingsScreen(
                 )
             }
 
-            // 4. Behavior Toggles
+            // 4. JARVIS Incoming Call System ("JARVIS Calls You")
+            SettingsSectionCard(
+                title = "JARVIS CALLS YOU (SCHEDULED & AUTO-CALLS)",
+                icon = Icons.Filled.PhoneInTalk
+            ) {
+                Text(
+                    text = "Schedule unlimited lock-screen calls from JARVIS for study wake-ups, YouTube/Instagram views check, or custom reminders. You can also create calls by voice (e.g., \"Kal subah 6 baje padhne ke liye call karna\").",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                BehaviorToggleRow(
+                    title = "Auto-Call When Online / Viral Alert",
+                    subtitle = "Detects viral milestones, notification surges (15+ in 5 min), or urgent messages via Notification Access and calls you automatically when online",
+                    checked = onlineAutoCallEnabled,
+                    onCheckedChange = { enable ->
+                        if (enable) onRequestPostNotificationsPermission()
+                        onlineAutoCallEnabled = enable
+                        onSaveSettings(buildCurrentEntity())
+                    },
+                    tag = "toggle_online_auto_call"
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = { showScheduleDialog = true },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ArcCyan,
+                            contentColor = ObsidianVoid
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("add_scheduled_call_button")
+                    ) {
+                        Icon(Icons.Filled.AddAlert, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("SCHEDULE CALL")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            onRequestPostNotificationsPermission()
+                            onTestIncomingCall()
+                        },
+                        border = BorderStroke(1.dp, SignalGreen.copy(alpha = 0.75f)),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("test_incoming_call_button")
+                    ) {
+                        Icon(
+                            Icons.Filled.Call,
+                            contentDescription = null,
+                            tint = SignalGreen,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("TEST CALL", color = SignalGreen)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                if (scheduledCalls.isEmpty()) {
+                    Surface(
+                        shape = MaterialTheme.shapes.medium,
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "No scheduled calls yet. Tap \"SCHEDULE CALL\" above or tell JARVIS by voice.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        scheduledCalls.forEach { call ->
+                            ScheduledCallRowCard(
+                                call = call,
+                                onToggle = { enabled -> onToggleScheduledCall(call, enabled) },
+                                onDelete = { onDeleteScheduledCall(call) }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 5. JARVIS Neural Core Key Section (Strictly zero third-party model branding)
+            SettingsSectionCard(
+                title = "JARVIS NEURAL CORE",
+                icon = Icons.Filled.Key
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = ArcCyan.copy(alpha = 0.12f),
+                    border = BorderStroke(1.dp, ArcCyan.copy(alpha = 0.45f))
+                ) {
+                    Text(
+                        text = "ENGINE: JARVIS NEURAL CORE",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = ArcCyan,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                OutlinedTextField(
+                    value = apiKey,
+                    onValueChange = {
+                        apiKey = it
+                        onResetVerification()
+                    },
+                    label = { Text("JARVIS AI Core API Key") },
+                    placeholder = { Text("Paste your neural access key") },
+                    singleLine = true,
+                    visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(
+                            onClick = { showApiKey = !showApiKey },
+                            modifier = Modifier.testTag("toggle_api_key_visibility")
+                        ) {
+                            Icon(
+                                imageVector = if (showApiKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = stringResource(R.string.cd_toggle_key_visibility)
+                            )
+                        }
+                    },
+                    colors = hudTextFieldColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("jarvis_api_key_input")
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            onSaveSettings(buildCurrentEntity())
+                            onVerifyApiKey(apiKey)
+                        },
+                        enabled = keyVerificationState !is KeyVerificationUiState.Verifying,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("verify_api_key_button")
+                    ) {
+                        if (keyVerificationState is KeyVerificationUiState.Verifying) {
+                            CircularProgressIndicator(
+                                strokeWidth = 2.dp,
+                                color = ObsidianVoid,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("VERIFYING…")
+                        } else {
+                            Text("VERIFY KEY")
+                        }
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            apiKey = ""
+                            onResetVerification()
+                            onSaveSettings(buildCurrentEntity())
+                            savedBanner = "Neural access key cleared from local vault."
+                        },
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        modifier = Modifier.testTag("clear_api_key_button")
+                    ) {
+                        Text("CLEAR")
+                    }
+                }
+
+                when (keyVerificationState) {
+                    is KeyVerificationUiState.Verified -> {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        VerificationBanner(
+                            icon = Icons.Filled.CheckCircle,
+                            color = SignalGreen,
+                            message = "JARVIS AI Core verified (${keyVerificationState.latencyMs}ms)"
+                        )
+                    }
+                    is KeyVerificationUiState.Failed -> {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        VerificationBanner(
+                            icon = Icons.Filled.ErrorOutline,
+                            color = SignalCrimson,
+                            message = keyVerificationState.reason
+                        )
+                    }
+                    else -> Unit
+                }
+            }
+
+            // 6. Editable Master System Prompt
+            SettingsSectionCard(
+                title = "MASTER SYSTEM PROMPT",
+                icon = Icons.Filled.Psychology
+            ) {
+                Text(
+                    text = "Injected dynamically into every JARVIS AI Core request. Customize personality, Hindi/Hinglish/English style, and phone automation priorities.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                OutlinedTextField(
+                    value = masterPrompt,
+                    onValueChange = { masterPrompt = it },
+                    label = { Text("JARVIS Core Directive") },
+                    minLines = 6,
+                    maxLines = 14,
+                    colors = hudTextFieldColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("master_prompt_input")
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            onSaveSettings(buildCurrentEntity())
+                            savedBanner = "Master System Prompt updated."
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("save_master_prompt_button")
+                    ) {
+                        Icon(Icons.Filled.Save, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("SAVE PROMPT")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            masterPrompt = DEFAULT_MASTER_PROMPT
+                            onSaveSettings(buildCurrentEntity())
+                            savedBanner = "Master System Prompt reset to JARVIS defaults."
+                        },
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                        modifier = Modifier.testTag("reset_master_prompt_button")
+                    ) {
+                        Icon(Icons.Filled.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("RESET")
+                    }
+                }
+            }
+
+            // 7. Agent Behavior Protocols
             SettingsSectionCard(
                 title = "AGENT BEHAVIOR PROTOCOLS",
                 icon = Icons.Filled.Tune
             ) {
                 BehaviorToggleRow(
-                    title = "Continuous Wake-Word Listening",
-                    subtitle = "Passively listen for \"Hey Jarvis\" to trigger voice actions hands-free",
+                    title = "In-App Passive Wake Phrase",
+                    subtitle = "Listen for \"${customWakeWord.ifBlank { "Jarvis" }}\" while JARVIS HUD is open in foreground",
                     checked = wakeWordEnabled,
                     onCheckedChange = {
                         wakeWordEnabled = it
@@ -501,7 +822,7 @@ fun SettingsScreen(
                 )
                 BehaviorToggleRow(
                     title = "Auto-Read Screen Context",
-                    subtitle = "Attach Accessibility UI tree coordinates to every gemini-3.5-flash query",
+                    subtitle = "Attach live Accessibility UI coordinates to every JARVIS AI Core automation step",
                     checked = autoReadScreen,
                     onCheckedChange = {
                         autoReadScreen = it
@@ -512,7 +833,7 @@ fun SettingsScreen(
                 BehaviorToggleRow(
                     title = "Floating Overlay Orb",
                     subtitle = if (overlayPermissionGranted) {
-                        "Show draggable Arc Reactor orb over other apps"
+                        "Show draggable JARVIS Arc Reactor orb over other apps"
                     } else {
                         "Requires Display Over Other Apps permission (tap to grant)"
                     },
@@ -540,7 +861,7 @@ fun SettingsScreen(
                 BehaviorToggleRow(
                     title = "Auto-Reply / Chat Mode (WhatsApp, Telegram, SMS)",
                     subtitle = if (notificationListenerGranted) {
-                        "Automatically reply in background via ${GeminiApiClient.MODEL_NAME} and log chats locally"
+                        "Automatically reply in background via JARVIS AI Core and log chats locally"
                     } else {
                         "Notification Access required — tap to grant or toggle on"
                     },
@@ -578,7 +899,7 @@ fun SettingsScreen(
                             .testTag("settings_open_notification_access_button")
                     ) {
                         Text(
-                            text = "ENABLE NOTIFICATION ACCESS FOR AUTO-REPLY",
+                            text = "ENABLE NOTIFICATION ACCESS FOR AUTO-REPLY & ALERTS",
                             color = StarkAmber
                         )
                     }
@@ -588,6 +909,259 @@ fun SettingsScreen(
             Spacer(modifier = Modifier.height(16.dp))
         }
     }
+}
+
+@Composable
+private fun ScheduledCallRowCard(
+    call: ScheduledCallEntity,
+    onToggle: (Boolean) -> Unit,
+    onDelete: () -> Unit
+) {
+    val typeLabel = when (call.actionType) {
+        CALL_TYPE_WAKE_UP_STUDY -> "WAKE-UP / STUDY"
+        CALL_TYPE_SMART_VIEWS_CHECK -> "SMART VIEWS CHECK"
+        else -> "CUSTOM REMINDER"
+    }
+    val typeColor = when (call.actionType) {
+        CALL_TYPE_WAKE_UP_STUDY -> StarkAmber
+        CALL_TYPE_SMART_VIEWS_CHECK -> SignalGreen
+        else -> ArcCyan
+    }
+
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(
+            1.dp,
+            if (call.enabled) typeColor.copy(alpha = 0.55f) else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("scheduled_call_card_${call.id}")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = CallAlarmScheduler.formatTime12Hour(call.hour, call.minute),
+                        style = MaterialTheme.typography.titleMedium,
+                        color = if (call.enabled) ArcCyan else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = typeColor.copy(alpha = 0.14f),
+                        border = BorderStroke(1.dp, typeColor.copy(alpha = 0.45f))
+                    ) {
+                        Text(
+                            text = typeLabel,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = typeColor,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(3.dp))
+                Text(
+                    text = call.purpose,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    text = "Repeat: ${CallAlarmScheduler.formatRepeatLabel(call.repeatDaysCsv)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Switch(
+                checked = call.enabled,
+                onCheckedChange = onToggle,
+                colors = SwitchDefaults.colors(
+                    checkedThumbColor = ObsidianVoid,
+                    checkedTrackColor = ArcCyan
+                ),
+                modifier = Modifier.testTag("toggle_scheduled_call_${call.id}")
+            )
+            IconButton(
+                onClick = onDelete,
+                modifier = Modifier.testTag("delete_scheduled_call_${call.id}")
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Delete,
+                    contentDescription = "Delete scheduled call",
+                    tint = SignalCrimson
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+private fun ScheduleCallDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (hour: Int, minute: Int, purpose: String, actionType: String, repeatCsv: String) -> Unit
+) {
+    val now = remember { Calendar.getInstance() }
+    val timeState = rememberTimePickerState(
+        initialHour = now.get(Calendar.HOUR_OF_DAY),
+        initialMinute = (now.get(Calendar.MINUTE) + 5) % 60,
+        is24Hour = false
+    )
+    var purpose by remember { mutableStateOf("") }
+    var actionType by remember { mutableStateOf(CALL_TYPE_WAKE_UP_STUDY) }
+    var repeatMode by remember { mutableStateOf("DAILY") } // "ONCE", "DAILY", "CUSTOM"
+    val selectedDays = remember {
+        mutableStateListOf(
+            Calendar.MONDAY,
+            Calendar.TUESDAY,
+            Calendar.WEDNESDAY,
+            Calendar.THURSDAY,
+            Calendar.FRIDAY
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        title = {
+            Text(
+                text = "Schedule JARVIS Incoming Call",
+                style = MaterialTheme.typography.titleMedium,
+                color = ArcCyan
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                TimeInput(state = timeState)
+
+                OutlinedTextField(
+                    value = purpose,
+                    onValueChange = { purpose = it },
+                    label = { Text("Call Purpose") },
+                    placeholder = { Text("e.g. Subah padhne ke liye uthana hai") },
+                    singleLine = false,
+                    maxLines = 3,
+                    colors = hudTextFieldColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("schedule_call_purpose_input")
+                )
+
+                Text(
+                    text = "Call Mode",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    FilterChip(
+                        selected = actionType == CALL_TYPE_WAKE_UP_STUDY,
+                        onClick = { actionType = CALL_TYPE_WAKE_UP_STUDY },
+                        label = { Text("Wake-Up / Study") }
+                    )
+                    FilterChip(
+                        selected = actionType == CALL_TYPE_SMART_VIEWS_CHECK,
+                        onClick = { actionType = CALL_TYPE_SMART_VIEWS_CHECK },
+                        label = { Text("Views Check") }
+                    )
+                    FilterChip(
+                        selected = actionType == CALL_TYPE_CUSTOM_REMINDER,
+                        onClick = { actionType = CALL_TYPE_CUSTOM_REMINDER },
+                        label = { Text("Reminder") }
+                    )
+                }
+
+                Text(
+                    text = "Repeat Schedule",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    FilterChip(
+                        selected = repeatMode == "ONCE",
+                        onClick = { repeatMode = "ONCE" },
+                        label = { Text("Once") }
+                    )
+                    FilterChip(
+                        selected = repeatMode == "DAILY",
+                        onClick = { repeatMode = "DAILY" },
+                        label = { Text("Daily") }
+                    )
+                    FilterChip(
+                        selected = repeatMode == "CUSTOM",
+                        onClick = { repeatMode = "CUSTOM" },
+                        label = { Text("Custom Days") }
+                    )
+                }
+
+                if (repeatMode == "CUSTOM") {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        WEEKDAY_OPTIONS.forEach { (dayInt, label) ->
+                            val isSelected = selectedDays.contains(dayInt)
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = {
+                                    if (isSelected && selectedDays.size > 1) {
+                                        selectedDays.remove(dayInt)
+                                    } else if (!isSelected) {
+                                        selectedDays.add(dayInt)
+                                    }
+                                },
+                                label = { Text(label) }
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val repeatCsv = when (repeatMode) {
+                        "ONCE" -> "ONCE"
+                        "CUSTOM" -> selectedDays.sorted().joinToString(",")
+                        else -> "DAILY"
+                    }
+                    val finalPurpose = purpose.trim().ifBlank {
+                        when (actionType) {
+                            CALL_TYPE_WAKE_UP_STUDY -> "Subah padhne ke liye wake-up call"
+                            CALL_TYPE_SMART_VIEWS_CHECK -> "YouTube / Instagram views check briefing"
+                            else -> "Scheduled JARVIS reminder call"
+                        }
+                    }
+                    onConfirm(timeState.hour, timeState.minute, finalPurpose, actionType, repeatCsv)
+                },
+                modifier = Modifier.testTag("confirm_schedule_call_button")
+            ) {
+                Text("SAVE CALL")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("CANCEL")
+            }
+        }
+    )
 }
 
 @Composable

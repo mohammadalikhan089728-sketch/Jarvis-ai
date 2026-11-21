@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccessibilityNew
+import androidx.compose.material.icons.filled.Assistant
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.FlashlightOn
 import androidx.compose.material.icons.filled.Info
@@ -26,6 +27,7 @@ import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -59,7 +61,9 @@ fun PermissionsScreen(
     permissions: PermissionsSnapshot,
     screenSummary: String,
     onRequestMic: () -> Unit,
+    onOpenDefaultAssistantSettings: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
+    onTestScreenTap: () -> Unit,
     onOpenNotificationListenerSettings: () -> Unit,
     onOpenAppInfoSettings: () -> Unit,
     onRequestOverlay: () -> Unit,
@@ -138,7 +142,7 @@ fun PermissionsScreen(
                         color = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "${permissions.activeCount}/7 subsystems online • Android API ${Build.VERSION.SDK_INT}",
+                        text = "Developed by Mozahid • ${permissions.activeCount}/7 online • API ${Build.VERSION.SDK_INT}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -154,11 +158,64 @@ fun PermissionsScreen(
                 }
             }
 
+            // 0. Default Digital Assistant App Registration
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.large,
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                border = BorderStroke(1.dp, ArcCyan.copy(alpha = 0.6f))
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Assistant,
+                                contentDescription = null,
+                                tint = ArcCyan,
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = "Default Digital Assistant App",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = "System Settings > Default Apps",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = ArcCyan
+                                )
+                            }
+                        }
+                        Button(
+                            onClick = onOpenDefaultAssistantSettings,
+                            modifier = Modifier.testTag("perm_default_assistant_button")
+                        ) {
+                            Text("SET DEFAULT")
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "Select JARVIS in Android's Digital Assistant menu so system assistant triggers launch JARVIS directly.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
             // 1. Microphone
             PermissionChecklistCard(
                 icon = Icons.Filled.Mic,
                 title = "Microphone Voice Uplink",
-                description = "Required for Push-to-Talk and continuous \"Hey Jarvis\" wake-word recognition.",
+                description = "Required for Push-to-Talk, live conversation, and Always-On background wake-word detection.",
                 isActive = permissions.microphoneGranted,
                 actionLabel = if (permissions.microphoneGranted) "GRANTED" else "ENABLE",
                 onAction = onRequestMic,
@@ -212,10 +269,28 @@ fun PermissionsScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Enables full screen hierarchy reading, taps, 360° drags, multi-touch pinch/rotate, text typing, and global controls.",
+                        text = "Enables full multi-window screen hierarchy reading, reliable physical taps, 360° drags, multi-touch pinch/rotate, text typing, and global controls.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = onTestScreenTap,
+                        border = BorderStroke(1.dp, ArcCyan.copy(alpha = 0.65f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("perm_test_screen_tap_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.TouchApp,
+                            contentDescription = null,
+                            tint = ArcCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("TEST SCREEN TAP", color = ArcCyan)
+                    }
 
                     if (!permissions.accessibilityActive && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                         Spacer(modifier = Modifier.height(10.dp))

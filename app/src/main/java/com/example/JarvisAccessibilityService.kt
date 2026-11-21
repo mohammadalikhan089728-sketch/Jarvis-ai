@@ -1,17 +1,22 @@
 package com.example
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
@@ -39,30 +44,31 @@ data class ScreenHierarchySnapshot(
     val capturedAt: Long = System.currentTimeMillis()
 ) {
     /**
-     * Ultra-compact JSON payload (short keys, stripped layout containers)
-     * engineered for millisecond gemini-3.5-flash inference.
+     * Compact JSON schema containing id, text, desc, x, y, clickable, editable, scrollable
+     * for ultra-reliable real-time touch control and multi-step phone automation.
      */
     fun toCompactJson(): String {
         val root = JSONObject()
-        root.put("p", packageName)
-        root.put("w", screenWidth)
-        root.put("h", screenHeight)
+        root.put("package", packageName)
+        root.put("width", screenWidth)
+        root.put("height", screenHeight)
         val arr = JSONArray()
         for (node in nodes) {
             val obj = JSONObject()
-            if (node.text.isNotBlank()) obj.put("t", node.text)
+            if (node.viewId.isNotBlank()) obj.put("id", node.viewId)
+            if (node.text.isNotBlank()) obj.put("text", node.text)
             if (node.contentDescription.isNotBlank() && node.contentDescription != node.text) {
-                obj.put("d", node.contentDescription)
+                obj.put("desc", node.contentDescription)
             }
             obj.put("x", node.centerX)
             obj.put("y", node.centerY)
-            if (node.clickable) obj.put("c", 1)
-            if (node.editable) obj.put("e", 1)
-            if (node.scrollable) obj.put("s", 1)
-            if (node.checked) obj.put("k", 1)
+            if (node.clickable) obj.put("clickable", true)
+            if (node.editable) obj.put("editable", true)
+            if (node.scrollable) obj.put("scrollable", true)
+            if (node.checked) obj.put("checked", true)
             arr.put(obj)
         }
-        root.put("n", arr)
+        root.put("nodes", arr)
         return root.toString()
     }
 
@@ -70,7 +76,7 @@ data class ScreenHierarchySnapshot(
         val lines = nodes
             .mapNotNull { it.text.ifBlank { it.contentDescription }.takeIf(String::isNotBlank) }
             .distinct()
-            .take(45)
+            .take(55)
         return if (lines.isEmpty()) {
             "Active app: $packageName. No readable text detected on screen."
         } else {
@@ -106,13 +112,13 @@ class JarvisAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString()
-        if (!pkg.isNullOrBlank()) {
+        if (!pkg.isNullOrBlank() && pkg != packageName) {
             _activePackageName.value = pkg
         }
     }
 
     override fun onInterrupt() {
-        // Required override; service remains bound unless user disables it.
+        // Required override; service stays active until disabled by user.
     }
 
     override fun onDestroy() {
@@ -124,24 +130,60 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Captures a compressed UI tree by stripping empty/invisible layout containers
-     * and keeping only meaningful text, input, scrollable, or clickable nodes with (x, y) coords.
+     * Collects rootInActiveWindow plus all interactive application/system windows
+     * so dialogs, sheets, popups, and keyboards are always captured accurately.
      */
-    fun readScreenHierarchy(maxNodes: Int = 72): ScreenHierarchySnapshot? {
-        val root = rootInActiveWindow ?: return null
+    private fun collectInteractiveRoots(): List<AccessibilityNodeInfo> {
+        val roots = mutableListOf<AccessibilityNodeInfo>()
+        val seenWindowIds = HashSet<Int>()
+
+        rootInActiveWindow?.let { active ->
+            roots.add(active)
+            seenWindowIds.add(active.windowId)
+        }
+
+        val allWindows = runCatching { windows }.getOrNull().orEmpty()
+        for (win in allWindows) {
+            val type = win.type
+            if (type != AccessibilityWindowInfo.TYPE_APPLICATION &&
+                type != AccessibilityWindowInfo.TYPE_SYSTEM &&
+                type != AccessibilityWindowInfo.TYPE_INPUT_METHOD
+            ) continue
+            val root = runCatching { win.root }.getOrNull() ?: continue
+            // Skip our own floating Stop HUD pill when inspecting other apps
+            val winPkg = root.packageName?.toString().orEmpty()
+            if (winPkg == packageName && roots.any { it.packageName?.toString() != packageName }) {
+                continue
+            }
+            if (seenWindowIds.add(root.windowId)) {
+                roots.add(root)
+            }
+        }
+        return roots
+    }
+
+    /**
+     * Traverses rootInActiveWindow AND all interactive windows, extracting visible nodes
+     * with rect.width() > 0 && rect.height() > 0 into compact JSON.
+     */
+    fun readScreenHierarchy(maxNodes: Int = 85): ScreenHierarchySnapshot? {
+        val roots = collectInteractiveRoots()
+        if (roots.isEmpty()) return null
+
         val bounds = gestureEngine.getScreenBounds()
         val nodes = mutableListOf<ScreenNodeModel>()
         val seenKeys = HashSet<String>(maxNodes)
-        val pkgName = root.packageName?.toString() ?: _activePackageName.value.ifBlank { "unknown" }
+        val pkgName = roots.firstOrNull()?.packageName?.toString()
+            ?: _activePackageName.value.ifBlank { "unknown" }
 
         fun traverse(node: AccessibilityNodeInfo?, depth: Int) {
-            if (node == null || depth > 22 || nodes.size >= maxNodes) return
+            if (node == null || depth > 26 || nodes.size >= maxNodes) return
             if (!node.isVisibleToUser) return
 
             val rect = Rect()
             node.getBoundsInScreen(rect)
-            val inBounds = rect.width() > 6 &&
-                rect.height() > 6 &&
+            val hasValidBounds = rect.width() > 0 &&
+                rect.height() > 0 &&
                 rect.right > 0 &&
                 rect.bottom > 0 &&
                 rect.left < bounds.widthPx &&
@@ -149,6 +191,10 @@ class JarvisAccessibilityService : AccessibilityService() {
 
             val text = node.text?.toString()?.trim().orEmpty().take(120)
             val desc = node.contentDescription?.toString()?.trim().orEmpty().take(120)
+            val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                node.hintText?.toString()?.trim().orEmpty().take(80)
+            } else ""
+            val effectiveText = text.ifBlank { hint }
             val shortId = node.viewIdResourceName?.substringAfterLast("/")?.trim().orEmpty()
             val shortClass = node.className?.toString()?.substringAfterLast(".")?.trim().orEmpty()
 
@@ -159,19 +205,18 @@ class JarvisAccessibilityService : AccessibilityService() {
                 shortClass == "LinearLayout" ||
                 shortClass == "RecyclerView"
 
-            val hasContent = text.isNotEmpty() || desc.isNotEmpty()
-            val isInputOrAction = node.isEditable || (node.isClickable && (!isPureContainer || hasContent))
-            val isActionableScroll = node.isScrollable && hasContent
+            val hasContent = effectiveText.isNotEmpty() || desc.isNotEmpty() || shortId.isNotEmpty()
+            val isInteractive = node.isEditable || node.isClickable || node.isCheckable || node.isScrollable
 
-            if (inBounds && (hasContent || isInputOrAction || isActionableScroll)) {
-                val cx = rect.centerX().coerceIn(0, bounds.widthPx)
-                val cy = rect.centerY().coerceIn(0, bounds.heightPx)
-                val dedupKey = "${text.ifBlank { desc }}@${cx / 16}_${cy / 16}_${node.isEditable}"
+            if (hasValidBounds && (effectiveText.isNotEmpty() || desc.isNotEmpty() || (isInteractive && (!isPureContainer || hasContent)))) {
+                val cx = rect.centerX().coerceIn(2, bounds.widthPx - 2)
+                val cy = rect.centerY().coerceIn(2, bounds.heightPx - 2)
+                val dedupKey = "${effectiveText.ifBlank { desc }.ifBlank { shortId }}@${cx / 14}_${cy / 14}_${node.isEditable}"
                 if (seenKeys.add(dedupKey)) {
                     nodes.add(
                         ScreenNodeModel(
                             index = nodes.size,
-                            text = text,
+                            text = effectiveText,
                             contentDescription = desc,
                             viewId = shortId,
                             className = shortClass,
@@ -193,7 +238,11 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
 
-        traverse(root, 0)
+        for (root in roots) {
+            if (nodes.size >= maxNodes) break
+            traverse(root, 0)
+        }
+
         val snapshot = ScreenHierarchySnapshot(
             packageName = pkgName,
             screenWidth = bounds.widthPx,
@@ -204,32 +253,103 @@ class JarvisAccessibilityService : AccessibilityService() {
         return snapshot
     }
 
+    /**
+     * Physical finger tap gesture using Path.moveTo(x, y) (80ms duration) via dispatchGesture
+     * awaited cleanly with CompletableDeferred so multi-step automation waits until touch finishes.
+     */
+    suspend fun tapXY(x: Float, y: Float, durationMs: Long = 80L): Boolean {
+        val bounds = gestureEngine.getScreenBounds()
+        val cx = x.coerceIn(2f, (bounds.widthPx - 2).toFloat())
+        val cy = y.coerceIn(2f, (bounds.heightPx - 2).toFloat())
+        val path = Path().apply { moveTo(cx, cy) }
+        val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(40L, 300L))
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+
+        val deferred = CompletableDeferred<Boolean>()
+        val dispatched = dispatchGesture(
+            gesture,
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    deferred.complete(true)
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    deferred.complete(false)
+                }
+            },
+            null
+        )
+        if (!dispatched) return false
+        return withTimeoutOrNull(4_000L) { deferred.await() } ?: false
+    }
+
+    /**
+     * Dual-Action Reliable Touch Execution:
+     * 1. Finds matching node across all interactive windows by text/contentDescription/hintText.
+     * 2. Tries AccessibilityNodeInfo.ACTION_CLICK (climbing up to parent if needed).
+     * 3. If ACTION_CLICK fails OR node is inside WebView/Compose surface without standard click handler,
+     *    immediately executes physical tapXY(rect.centerX(), rect.centerY()) on screen bounds!
+     */
     suspend fun tapByText(targetText: String): Boolean {
         val query = targetText.trim()
         if (query.isEmpty()) return false
-        val root = rootInActiveWindow ?: return false
+        val roots = collectInteractiveRoots()
+        if (roots.isEmpty()) return false
 
-        val bestMatch = findBestMatchingNode(root, query) ?: return false
+        var bestMatch: AccessibilityNodeInfo? = null
+        for (root in roots) {
+            bestMatch = findBestMatchingNode(root, query)
+            if (bestMatch != null) break
+        }
+        val matched = bestMatch ?: return false
 
-        var clickableNode: AccessibilityNodeInfo? = bestMatch
+        val rect = Rect()
+        matched.getBoundsInScreen(rect)
+        val hasBounds = rect.width() > 0 && rect.height() > 0
+        val clsName = matched.className?.toString().orEmpty()
+        val isWebOrCompose = clsName.contains("WebView", ignoreCase = true) ||
+            clsName.equals("android.view.View", ignoreCase = true)
+
+        var clickableNode: AccessibilityNodeInfo? = matched
         var hops = 0
         while (clickableNode != null && !clickableNode.isClickable && hops < 6) {
             clickableNode = clickableNode.parent
             hops++
         }
 
-        if (clickableNode != null && clickableNode.isClickable) {
+        if (!isWebOrCompose && clickableNode != null && clickableNode.isClickable) {
             if (clickableNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                 return true
             }
         }
 
-        val rect = Rect()
-        bestMatch.getBoundsInScreen(rect)
-        if (rect.width() > 0 && rect.height() > 0) {
-            return gestureEngine.tap(rect.centerX().toFloat(), rect.centerY().toFloat())
+        if (hasBounds) {
+            val tapped = tapXY(rect.centerX().toFloat(), rect.centerY().toFloat())
+            if (tapped) return true
+        }
+
+        if (clickableNode != null && clickableNode.isClickable) {
+            return clickableNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         }
         return false
+    }
+
+    suspend fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long = 320L): Boolean {
+        return gestureEngine.dragAnyDirection(x1, y1, x2, y2, durationMs)
+    }
+
+    suspend fun scrollDown(): Boolean = performDirectionalScroll("SCROLL_DOWN")
+
+    suspend fun scrollUp(): Boolean = performDirectionalScroll("SCROLL_UP")
+
+    suspend fun longPress(x: Float, y: Float, durationMs: Long = 750L): Boolean {
+        return gestureEngine.longPress(x, y, durationMs)
+    }
+
+    suspend fun performDiagnosticTestTap(): Boolean {
+        val bounds = gestureEngine.getScreenBounds()
+        // Dispatch a harmless physical tap at the neutral top-center status bar margin
+        return tapXY(bounds.widthPx * 0.5f, (bounds.heightPx * 0.03f).coerceAtLeast(18f), durationMs = 80L)
     }
 
     suspend fun performDirectionalScroll(direction: String): Boolean {
@@ -265,44 +385,59 @@ class JarvisAccessibilityService : AccessibilityService() {
         targetFieldHint: String? = null,
         submitAfterTyping: Boolean = false
     ): Boolean {
-        val root = rootInActiveWindow ?: return false
+        val roots = collectInteractiveRoots()
+        if (roots.isEmpty()) return false
 
-        val targetNode = when {
-            !targetFieldHint.isNullOrBlank() -> {
-                findBestMatchingNode(root, targetFieldHint, requireEditable = true)
-                    ?: findBestMatchingNode(root, targetFieldHint, requireEditable = false)
+        var targetNode: AccessibilityNodeInfo? = null
+        for (root in roots) {
+            targetNode = when {
+                !targetFieldHint.isNullOrBlank() -> {
+                    findBestMatchingNode(root, targetFieldHint, requireEditable = true)
+                        ?: findBestMatchingNode(root, targetFieldHint, requireEditable = false)
+                }
+                else -> {
+                    root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                        ?: findFirstEditableNode(root)
+                }
             }
-            else -> {
-                root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                    ?: findFirstEditableNode(root)
-            }
-        } ?: return false
+            if (targetNode != null) break
+        }
+        val editableNode = targetNode ?: return false
 
         val rect = Rect()
-        targetNode.getBoundsInScreen(rect)
-        if (!targetNode.isFocused) {
-            targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-            targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        editableNode.getBoundsInScreen(rect)
+        if (!editableNode.isFocused) {
+            editableNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            editableNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             if (rect.width() > 0 && rect.height() > 0) {
-                gestureEngine.tap(rect.centerX().toFloat(), rect.centerY().toFloat())
+                tapXY(rect.centerX().toFloat(), rect.centerY().toFloat())
             }
         }
 
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
-        var entered = targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        var entered = editableNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
 
         if (!entered) {
-            // Clipboard fallback for custom input views that ignore ACTION_SET_TEXT
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("jarvis_input", text))
-            entered = targetNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            entered = editableNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
         }
 
-        if (entered && submitAfterTyping && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            runCatching {
-                targetNode.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+        if (entered && submitAfterTyping) {
+            var submitted = false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                submitted = runCatching {
+                    editableNode.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                }.getOrDefault(false)
+            }
+            if (!submitted) {
+                // Fallback: tap a visible Search / Send / Go button on screen or keyboard
+                val submitLabels = listOf("Search", "Send", "Go", "Done", "Submit")
+                for (label in submitLabels) {
+                    if (tapByText(label)) break
+                }
             }
         }
         return entered
@@ -345,7 +480,7 @@ class JarvisAccessibilityService : AccessibilityService() {
         var partialMatch: AccessibilityNodeInfo? = null
 
         fun search(node: AccessibilityNodeInfo?, depth: Int) {
-            if (node == null || depth > 24 || exactMatch != null) return
+            if (node == null || depth > 26 || exactMatch != null) return
             if (!node.isVisibleToUser) return
 
             val text = node.text?.toString()?.trim().orEmpty().lowercase()
@@ -380,7 +515,7 @@ class JarvisAccessibilityService : AccessibilityService() {
     private fun findFirstEditableNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var found: AccessibilityNodeInfo? = null
         fun search(node: AccessibilityNodeInfo?, depth: Int) {
-            if (node == null || depth > 24 || found != null) return
+            if (node == null || depth > 26 || found != null) return
             if (!node.isVisibleToUser) return
             if (node.isEditable) {
                 found = node
@@ -398,7 +533,7 @@ class JarvisAccessibilityService : AccessibilityService() {
     private fun findFirstScrollableNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         var found: AccessibilityNodeInfo? = null
         fun search(node: AccessibilityNodeInfo?, depth: Int) {
-            if (node == null || depth > 20 || found != null) return
+            if (node == null || depth > 22 || found != null) return
             if (!node.isVisibleToUser) return
             if (node.isScrollable) {
                 found = node
