@@ -78,11 +78,13 @@ fun SettingsScreen(
     activeVoiceLabel: String,
     lastVoiceStatus: String,
     overlayPermissionGranted: Boolean,
+    notificationListenerGranted: Boolean,
     onSaveSettings: (SettingsEntity) -> Unit,
     onVerifyApiKey: (String) -> Unit,
     onResetVerification: () -> Unit,
     onTestVoice: (SettingsEntity) -> Unit,
     onRequestOverlayPermission: () -> Unit,
+    onOpenNotificationListenerSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var apiKey by rememberSaveable { mutableStateOf(settings.geminiApiKey) }
@@ -96,6 +98,8 @@ fun SettingsScreen(
     var autoReadScreen by rememberSaveable { mutableStateOf(settings.autoReadScreenContext) }
     var floatingOverlay by rememberSaveable { mutableStateOf(settings.floatingOverlayEnabled) }
     var offlineFirst by rememberSaveable { mutableStateOf(settings.offlineFirstMode) }
+    var autoReplyEnabled by rememberSaveable { mutableStateOf(settings.autoReplyEnabled) }
+    var autoReplyTargetContact by rememberSaveable { mutableStateOf(settings.autoReplyTargetContact) }
     var savedBanner by remember { mutableStateOf<String?>(null) }
 
     // Synchronize local form fields when Room initially emits saved values
@@ -110,6 +114,8 @@ fun SettingsScreen(
         autoReadScreen = settings.autoReadScreenContext
         floatingOverlay = settings.floatingOverlayEnabled
         offlineFirst = settings.offlineFirstMode
+        autoReplyEnabled = settings.autoReplyEnabled
+        autoReplyTargetContact = settings.autoReplyTargetContact
     }
 
     fun buildCurrentEntity(): SettingsEntity {
@@ -124,7 +130,9 @@ fun SettingsScreen(
             wakeWordEnabled = wakeWordEnabled,
             autoReadScreenContext = autoReadScreen,
             floatingOverlayEnabled = floatingOverlay,
-            offlineFirstMode = offlineFirst
+            offlineFirstMode = offlineFirst,
+            autoReplyEnabled = autoReplyEnabled,
+            autoReplyTargetContact = autoReplyTargetContact.trim()
         )
     }
 
@@ -529,6 +537,52 @@ fun SettingsScreen(
                     },
                     tag = "toggle_offline_first"
                 )
+                BehaviorToggleRow(
+                    title = "Auto-Reply / Chat Mode (WhatsApp, Telegram, SMS)",
+                    subtitle = if (notificationListenerGranted) {
+                        "Automatically reply in background via ${GeminiApiClient.MODEL_NAME} and log chats locally"
+                    } else {
+                        "Notification Access required — tap to grant or toggle on"
+                    },
+                    checked = autoReplyEnabled,
+                    onCheckedChange = { enable ->
+                        autoReplyEnabled = enable
+                        onSaveSettings(buildCurrentEntity())
+                        if (enable && !notificationListenerGranted) {
+                            onOpenNotificationListenerSettings()
+                        }
+                    },
+                    tag = "toggle_auto_reply_settings"
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = autoReplyTargetContact,
+                    onValueChange = { autoReplyTargetContact = it },
+                    label = { Text("Auto-Reply Contact Filter (Optional)") },
+                    placeholder = { Text("Leave blank for all chats, or enter e.g. Ashif") },
+                    singleLine = true,
+                    colors = hudTextFieldColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("auto_reply_contact_filter_input")
+                )
+
+                if (!notificationListenerGranted) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = onOpenNotificationListenerSettings,
+                        border = BorderStroke(1.dp, StarkAmber.copy(alpha = 0.7f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_open_notification_access_button")
+                    ) {
+                        Text(
+                            text = "ENABLE NOTIFICATION ACCESS FOR AUTO-REPLY",
+                            color = StarkAmber
+                        )
+                    }
+                }
             }
 
             Spacer(modifier = Modifier.height(16.dp))

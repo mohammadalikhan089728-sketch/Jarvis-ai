@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.FlashlightOn
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
@@ -59,6 +60,7 @@ fun PermissionsScreen(
     screenSummary: String,
     onRequestMic: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
+    onOpenNotificationListenerSettings: () -> Unit,
     onOpenAppInfoSettings: () -> Unit,
     onRequestOverlay: () -> Unit,
     onRequestCamera: () -> Unit,
@@ -136,7 +138,7 @@ fun PermissionsScreen(
                         color = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = "${permissions.activeCount}/6 subsystems online • Android API ${Build.VERSION.SDK_INT}",
+                        text = "${permissions.activeCount}/7 subsystems online • Android API ${Build.VERSION.SDK_INT}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -257,11 +259,22 @@ fun PermissionsScreen(
                 }
             }
 
-            // 3. Floating Overlay Permission
+            // 3. Notification Listener (WhatsApp / Telegram / Instagram / SMS Auto-Reply Chat)
+            PermissionChecklistCard(
+                icon = Icons.Filled.NotificationsActive,
+                title = "Notification Access (Auto-Reply Chat)",
+                description = "Allows Jarvis to read incoming WhatsApp, Telegram, Instagram, and SMS notifications and send background AI replies via RemoteInput.",
+                isActive = permissions.notificationListenerActive,
+                actionLabel = if (permissions.notificationListenerActive) "ACTIVE" else "ENABLE",
+                onAction = onOpenNotificationListenerSettings,
+                tag = "perm_notification_listener_button"
+            )
+
+            // 4. Floating Overlay Permission
             PermissionChecklistCard(
                 icon = Icons.Filled.Layers,
-                title = "Floating Overlay Orb",
-                description = "Displays the draggable cyan Arc Reactor orb above other applications for instant hands-free summon.",
+                title = "Floating Overlay Orb & Stop HUD",
+                description = "Displays the draggable Arc Reactor orb and the floating emergency STOP button during autonomous multi-step execution.",
                 isActive = permissions.overlayGranted,
                 actionLabel = if (permissions.overlayGranted) "ACTIVE" else "ENABLE",
                 onAction = onRequestOverlay,

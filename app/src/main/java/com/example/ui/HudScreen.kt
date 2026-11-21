@@ -87,12 +87,13 @@ import java.util.Date
 import java.util.Locale
 
 private val QUICK_COMMANDS = listOf(
+    "Explain screen in Hindi",
+    "Kiska message aaya tha?",
+    "Read clipboard",
     "What time is it?",
     "Battery status",
     "Flashlight on",
-    "Read what's on screen",
-    "Scroll down",
-    "Zoom in"
+    "Scroll down"
 )
 
 @Composable
@@ -102,6 +103,8 @@ fun HudScreen(
     isLiveSessionActive: Boolean,
     inactivityRemainingMs: Long,
     isAutoSleepStandby: Boolean,
+    isMultiStepRunning: Boolean,
+    multiStepStatus: String,
     liveTranscript: String,
     statusBanner: String,
     settings: SettingsEntity,
@@ -109,6 +112,8 @@ fun HudScreen(
     history: List<ChatHistoryEntity>,
     onToggleVoice: () -> Unit,
     onStopSpeech: () -> Unit,
+    onStopMultiStep: () -> Unit,
+    onToggleAutoReply: (Boolean) -> Unit,
     onSubmitCommand: (String) -> Unit,
     onClearHistory: () -> Unit,
     onOpenSettings: () -> Unit,
@@ -176,10 +181,16 @@ fun HudScreen(
                         HudTopTelemetryHeader(
                             settings = settings,
                             permissions = permissions,
+                            onToggleAutoReply = onToggleAutoReply,
                             onOpenSettings = onOpenSettings,
                             onOpenPermissions = onOpenPermissions
                         )
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
+                        MultiStepStopBanner(
+                            visible = isMultiStepRunning,
+                            stepStatus = multiStepStatus,
+                            onStop = onStopMultiStep
+                        )
                         LiveSessionStatusPill(
                             isLiveSessionActive = isLiveSessionActive,
                             inactivityRemainingMs = inactivityRemainingMs,
@@ -239,10 +250,17 @@ fun HudScreen(
                     HudTopTelemetryHeader(
                         settings = settings,
                         permissions = permissions,
+                        onToggleAutoReply = onToggleAutoReply,
                         onOpenSettings = onOpenSettings,
                         onOpenPermissions = onOpenPermissions
                     )
                     Spacer(modifier = Modifier.height(8.dp))
+
+                    MultiStepStopBanner(
+                        visible = isMultiStepRunning,
+                        stepStatus = multiStepStatus,
+                        onStop = onStopMultiStep
+                    )
 
                     LiveSessionStatusPill(
                         isLiveSessionActive = isLiveSessionActive,
@@ -300,6 +318,7 @@ fun HudScreen(
 private fun HudTopTelemetryHeader(
     settings: SettingsEntity,
     permissions: PermissionsSnapshot,
+    onToggleAutoReply: (Boolean) -> Unit,
     onOpenSettings: () -> Unit,
     onOpenPermissions: () -> Unit
 ) {
@@ -316,7 +335,7 @@ private fun HudTopTelemetryHeader(
             )
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 TelemetryBadge(
                     label = GeminiApiClient.MODEL_NAME,
@@ -326,6 +345,25 @@ private fun HudTopTelemetryHeader(
                     label = if (permissions.accessibilityActive) "A11Y LIVE" else "A11Y OFF",
                     color = if (permissions.accessibilityActive) ArcCyan else SignalCrimson
                 )
+                Surface(
+                    onClick = { onToggleAutoReply(!settings.autoReplyEnabled) },
+                    shape = RoundedCornerShape(6.dp),
+                    color = (if (settings.autoReplyEnabled) SignalGreen else MaterialTheme.colorScheme.onSurfaceVariant)
+                        .copy(alpha = 0.14f),
+                    border = BorderStroke(
+                        1.dp,
+                        (if (settings.autoReplyEnabled) SignalGreen else MaterialTheme.colorScheme.outline)
+                            .copy(alpha = 0.65f)
+                    ),
+                    modifier = Modifier.testTag("hud_auto_reply_toggle")
+                ) {
+                    Text(
+                        text = if (settings.autoReplyEnabled) "AUTO-CHAT ON" else "AUTO-CHAT OFF",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (settings.autoReplyEnabled) SignalGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
             }
         }
 
@@ -337,7 +375,7 @@ private fun HudTopTelemetryHeader(
                 Icon(
                     imageVector = Icons.Filled.Security,
                     contentDescription = stringResource(R.string.cd_open_permissions),
-                    tint = if (permissions.activeCount >= 2) SignalGreen else StarkAmber
+                    tint = if (permissions.activeCount >= 3) SignalGreen else StarkAmber
                 )
             }
             IconButton(
@@ -348,6 +386,57 @@ private fun HudTopTelemetryHeader(
                     imageVector = Icons.Filled.Settings,
                     contentDescription = stringResource(R.string.cd_open_settings),
                     tint = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MultiStepStopBanner(
+    visible: Boolean,
+    stepStatus: String,
+    onStop: () -> Unit
+) {
+    AnimatedVisibility(visible = visible) {
+        Surface(
+            onClick = onStop,
+            shape = RoundedCornerShape(999.dp),
+            color = SignalCrimson.copy(alpha = 0.18f),
+            border = BorderStroke(1.dp, SignalCrimson.copy(alpha = 0.85f)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 6.dp)
+                .testTag("hud_stop_multi_step_button")
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.StopCircle,
+                        contentDescription = stringResource(R.string.cd_stop_multi_step),
+                        tint = SignalCrimson,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = stepStatus.ifBlank { "Autonomous Agent Running…" },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = SignalCrimson,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Text(
+                    text = "TAP TO STOP",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = SignalCrimson
                 )
             }
         }

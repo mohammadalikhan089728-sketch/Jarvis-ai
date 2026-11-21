@@ -40,9 +40,22 @@ class VoiceEngineManager(private val context: Context) {
     private var isTtsReady = false
     private var mediaPlayer: MediaPlayer? = null
     private var customPlaybackJob: Job? = null
+
     @Volatile
     private var activeUtteranceId: String? = null
     private var onSpeechFinishedCallback: (() -> Unit)? = null
+
+    // Sentence-by-sentence streaming speech queue state
+    @Volatile
+    private var isStreamingSessionOpen = false
+    @Volatile
+    private var streamInputFinished = false
+    @Volatile
+    private var streamSentencesQueuedCount = 0
+    @Volatile
+    private var streamLastUtteranceId: String? = null
+    private val customStreamBuffer = StringBuilder()
+    private var activeStreamSettings: SettingsEntity? = null
 
     private val _isSpeaking = MutableStateFlow(false)
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
@@ -64,11 +77,18 @@ class VoiceEngineManager(private val context: Context) {
                 configureAssistantAudioAttributes()
                 selectBestJarvisVoice()
                 attachUtteranceListener()
+                prewarmTtsPipeline()
             } else {
                 isTtsReady = false
                 _activeVoiceLabel.value = "System TTS unavailable"
                 _lastVoiceStatus.value = "Failed to initialize Android TTS engine."
             }
+        }
+    }
+
+    private fun prewarmTtsPipeline() {
+        runCatching {
+            tts?.playSilentUtterance(1L, TextToSpeech.QUEUE_FLUSH, "jarvis_prewarm")
         }
     }
 
@@ -119,16 +139,14 @@ class VoiceEngineManager(private val context: Context) {
         val lang = voice.locale.language.lowercase(Locale.ROOT)
         val country = voice.locale.country.uppercase(Locale.ROOT)
 
-        // Prioritize crisp British / American / Indian English voices
         if (lang == "en") score += 400
         when (country) {
-            "GB" -> score += 160 // Classic JARVIS British tone
+            "GB" -> score += 160
             "US" -> score += 120
             "IN" -> score += 90
             "AU" -> score += 80
         }
 
-        // Strongly prefer VERY_HIGH and HIGH neural/enhanced voices
         score += when {
             voice.quality >= Voice.QUALITY_VERY_HIGH -> 300
             voice.quality >= Voice.QUALITY_HIGH -> 200
@@ -136,10 +154,8 @@ class VoiceEngineManager(private val context: Context) {
             else -> 10
         }
 
-        // Prefer offline-capable voices slightly to keep <100ms latency reliable
         if (!voice.isNetworkConnectionRequired) score += 60
 
-        // Favor natural male/neural voice identifiers used by Google & Samsung TTS
         val preferredTokens = listOf(
             "gbd", "rjs", "fis", "tpd", "iom", "iol", "sfg",
             "male", "neural", "wavenet", "enhanced", "network", "local"
@@ -147,7 +163,6 @@ class VoiceEngineManager(private val context: Context) {
         for (token in preferredTokens) {
             if (name.contains(token)) score += 35
         }
-        // Avoid legacy low-quality/robotic fallback tags
         if (name.contains("espeak") || name.contains("pico")) score -= 200
 
         return score
@@ -156,22 +171,26 @@ class VoiceEngineManager(private val context: Context) {
     private fun attachUtteranceListener() {
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
-                if (utteranceId == activeUtteranceId) {
+                if (utteranceId == "jarvis_prewarm") return
+                if (utteranceId == activeUtteranceId || isStreamingSessionOpen) {
                     _isSpeaking.value = true
                 }
             }
 
             override fun onDone(utteranceId: String?) {
-                dispatchSpeechFinished(expectedUtteranceId = utteranceId)
+                if (utteranceId == "jarvis_prewarm") return
+                handleUtteranceCompleted(utteranceId)
             }
 
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
-                dispatchSpeechFinished(expectedUtteranceId = utteranceId)
+                if (utteranceId == "jarvis_prewarm") return
+                handleUtteranceCompleted(utteranceId)
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
-                dispatchSpeechFinished(expectedUtteranceId = utteranceId)
+                if (utteranceId == "jarvis_prewarm") return
+                handleUtteranceCompleted(utteranceId)
             }
 
             override fun onStop(utteranceId: String?, interrupted: Boolean) {
@@ -180,6 +199,32 @@ class VoiceEngineManager(private val context: Context) {
                 }
             }
         })
+    }
+
+    private fun handleUtteranceCompleted(utteranceId: String?) {
+        scope.launch {
+            if (isStreamingSessionOpen) {
+                if (streamInputFinished && utteranceId != null && utteranceId == streamLastUtteranceId) {
+                    completeStreamingSessionNow()
+                }
+                return@launch
+            }
+            dispatchSpeechFinished(expectedUtteranceId = utteranceId)
+        }
+    }
+
+    private fun completeStreamingSessionNow() {
+        isStreamingSessionOpen = false
+        streamInputFinished = false
+        streamSentencesQueuedCount = 0
+        streamLastUtteranceId = null
+        activeUtteranceId = null
+        activeStreamSettings = null
+        customStreamBuffer.clear()
+        _isSpeaking.value = false
+        val cb = onSpeechFinishedCallback
+        onSpeechFinishedCallback = null
+        cb?.invoke()
     }
 
     private fun dispatchSpeechFinished(expectedUtteranceId: String?) {
@@ -192,6 +237,103 @@ class VoiceEngineManager(private val context: Context) {
             val cb = onSpeechFinishedCallback
             onSpeechFinishedCallback = null
             cb?.invoke()
+        }
+    }
+
+    /**
+     * Begins a zero-lag sentence-by-sentence streaming TTS session.
+     * Call [enqueueStreamSentence] for each sentence arriving from gemini-3.5-flash SSE,
+     * then call [finishStreamingSpeech] when the stream closes.
+     */
+    fun beginStreamingSpeech(
+        settings: SettingsEntity,
+        onAllFinished: (() -> Unit)? = null
+    ) {
+        stop()
+        onSpeechFinishedCallback = onAllFinished
+        activeStreamSettings = settings
+        isStreamingSessionOpen = true
+        streamInputFinished = false
+        streamSentencesQueuedCount = 0
+        streamLastUtteranceId = null
+        customStreamBuffer.clear()
+    }
+
+    /**
+     * Feeds a completed sentence immediately into Android TTS using TextToSpeech.QUEUE_ADD
+     * (after flushing on the very first sentence) so JARVIS speaks within ~400ms.
+     */
+    fun enqueueStreamSentence(sentence: String) {
+        val clean = sentence.trim()
+        val settings = activeStreamSettings ?: return
+        if (clean.isEmpty() || !isStreamingSessionOpen) return
+
+        if (settings.voiceMode == VOICE_MODE_CUSTOM_URL && settings.customVoiceUrl.isNotBlank()) {
+            // Buffer for custom HTTP audio endpoint playback once stream finishes cleanly
+            if (customStreamBuffer.isNotEmpty()) customStreamBuffer.append(' ')
+            customStreamBuffer.append(clean)
+            return
+        }
+
+        val engine = tts
+        if (engine == null || !isTtsReady) return
+
+        val isFirst = streamSentencesQueuedCount == 0
+        if (isFirst) {
+            engine.setPitch(settings.voicePitch.coerceIn(0.55f, 1.5f))
+            engine.setSpeechRate(settings.voiceSpeed.coerceIn(0.6f, 1.75f))
+            _lastVoiceStatus.value = "Streaming Neural Voice (${_activeVoiceLabel.value})"
+        }
+
+        val params = Bundle().apply {
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+        }
+        val utteranceId = "jarvis_stream_${UUID.randomUUID()}"
+        val queueMode = if (isFirst) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+        streamSentencesQueuedCount++
+        streamLastUtteranceId = utteranceId
+        activeUtteranceId = utteranceId
+        _isSpeaking.value = true
+
+        val status = engine.speak(clean, queueMode, params, utteranceId)
+        if (status == TextToSpeech.ERROR) {
+            streamSentencesQueuedCount = (streamSentencesQueuedCount - 1).coerceAtLeast(0)
+        }
+    }
+
+    /**
+     * Signals that no more sentences will arrive in the current stream.
+     * Fires [onAllFinished] once the final queued sentence finishes speaking.
+     */
+    fun finishStreamingSpeech() {
+        scope.launch {
+            if (!isStreamingSessionOpen) return@launch
+            val settings = activeStreamSettings
+
+            if (settings != null &&
+                settings.voiceMode == VOICE_MODE_CUSTOM_URL &&
+                settings.customVoiceUrl.isNotBlank() &&
+                customStreamBuffer.isNotEmpty()
+            ) {
+                val fullText = customStreamBuffer.toString().trim()
+                val cb = onSpeechFinishedCallback
+                isStreamingSessionOpen = false
+                streamInputFinished = false
+                customStreamBuffer.clear()
+                activeStreamSettings = null
+                speak(fullText, settings, cb)
+                return@launch
+            }
+
+            streamInputFinished = true
+            val engine = tts
+            val nothingQueuedOrPlaying = streamSentencesQueuedCount == 0 ||
+                engine == null ||
+                !isTtsReady ||
+                (!engine.isSpeaking && !_isSpeaking.value)
+            if (nothingQueuedOrPlaying) {
+                completeStreamingSessionNow()
+            }
         }
     }
 
@@ -261,8 +403,6 @@ class VoiceEngineManager(private val context: Context) {
             return false
         }
 
-        // Direct .onnx model files cannot be executed as raw audio streams without a TTS HTTP bridge;
-        // verify reachability cleanly and inform the user while falling back to realistic local TTS.
         if (rawUrl.lowercase(Locale.ROOT).endsWith(".onnx")) {
             _lastVoiceStatus.value = "ONNX model link saved; point to a Piper/Sherpa HTTP TTS server for direct audio synthesis. Using Default Neural Voice."
             return false
@@ -281,7 +421,7 @@ class VoiceEngineManager(private val context: Context) {
         speed: Float,
         pitch: Float
     ): File? {
-        val maxAudioBytes = 10 * 1024 * 1024 // 10 MB safety cap
+        val maxAudioBytes = 10 * 1024 * 1024
         return try {
             val request = if (endpointUrl.contains("{text}")) {
                 val encoded = URLEncoder.encode(text, "UTF-8")
@@ -304,7 +444,6 @@ class VoiceEngineManager(private val context: Context) {
 
             httpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    // Retry with query parameter GET for simple Piper/Sherpa GET endpoints
                     if (response.code == 405 && !endpointUrl.contains("{text}")) {
                         val separator = if (endpointUrl.contains("?")) "&" else "?"
                         val encoded = URLEncoder.encode(text, "UTF-8")
@@ -387,6 +526,12 @@ class VoiceEngineManager(private val context: Context) {
     fun stop() {
         customPlaybackJob?.cancel()
         customPlaybackJob = null
+        isStreamingSessionOpen = false
+        streamInputFinished = false
+        streamSentencesQueuedCount = 0
+        streamLastUtteranceId = null
+        activeStreamSettings = null
+        customStreamBuffer.clear()
         activeUtteranceId = null
         onSpeechFinishedCallback = null
         tts?.stop()

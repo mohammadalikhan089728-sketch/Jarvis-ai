@@ -26,4 +26,7 @@
     <string name="cd_run_macro">Run custom macro</string>
     <string name="cd_clear_history">Clear local interaction logs</string>
     <string name="cd_navigate_back">Navigate back</string>
+    <string name="notification_listener_label">Jarvis Auto-Reply Chat Listener</string>
+    <string name="cd_stop_multi_step">Stop autonomous multi-step execution</string>
+    <string name="cd_toggle_auto_reply">Toggle autonomous WhatsApp and message auto-reply mode</string>
 </resources>

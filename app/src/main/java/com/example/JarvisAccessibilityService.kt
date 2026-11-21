@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 
 data class ScreenNodeModel(
     val index: Int,
@@ -37,29 +38,44 @@ data class ScreenHierarchySnapshot(
     val nodes: List<ScreenNodeModel>,
     val capturedAt: Long = System.currentTimeMillis()
 ) {
+    /**
+     * Ultra-compact JSON payload (short keys, stripped layout containers)
+     * engineered for millisecond gemini-3.5-flash inference.
+     */
     fun toCompactJson(): String {
         val root = JSONObject()
-        root.put("package", packageName)
-        root.put("screenWidth", screenWidth)
-        root.put("screenHeight", screenHeight)
+        root.put("p", packageName)
+        root.put("w", screenWidth)
+        root.put("h", screenHeight)
         val arr = JSONArray()
         for (node in nodes) {
             val obj = JSONObject()
-            obj.put("i", node.index)
-            if (node.text.isNotBlank()) obj.put("text", node.text)
-            if (node.contentDescription.isNotBlank()) obj.put("desc", node.contentDescription)
-            if (node.viewId.isNotBlank()) obj.put("id", node.viewId)
-            obj.put("cls", node.className)
+            if (node.text.isNotBlank()) obj.put("t", node.text)
+            if (node.contentDescription.isNotBlank() && node.contentDescription != node.text) {
+                obj.put("d", node.contentDescription)
+            }
             obj.put("x", node.centerX)
             obj.put("y", node.centerY)
-            if (node.clickable) obj.put("click", true)
-            if (node.editable) obj.put("edit", true)
-            if (node.scrollable) obj.put("scroll", true)
-            if (node.checked) obj.put("checked", true)
+            if (node.clickable) obj.put("c", 1)
+            if (node.editable) obj.put("e", 1)
+            if (node.scrollable) obj.put("s", 1)
+            if (node.checked) obj.put("k", 1)
             arr.put(obj)
         }
-        root.put("elements", arr)
+        root.put("n", arr)
         return root.toString()
+    }
+
+    fun toPlainReadableText(): String {
+        val lines = nodes
+            .mapNotNull { it.text.ifBlank { it.contentDescription }.takeIf(String::isNotBlank) }
+            .distinct()
+            .take(45)
+        return if (lines.isEmpty()) {
+            "Active app: $packageName. No readable text detected on screen."
+        } else {
+            "Active app: $packageName\n" + lines.joinToString("\n")
+        }
     }
 
     fun toHumanSummary(): String {
@@ -107,45 +123,68 @@ class JarvisAccessibilityService : AccessibilityService() {
         _isServiceRunning.value = false
     }
 
-    fun readScreenHierarchy(maxNodes: Int = 120): ScreenHierarchySnapshot? {
+    /**
+     * Captures a compressed UI tree by stripping empty/invisible layout containers
+     * and keeping only meaningful text, input, scrollable, or clickable nodes with (x, y) coords.
+     */
+    fun readScreenHierarchy(maxNodes: Int = 72): ScreenHierarchySnapshot? {
         val root = rootInActiveWindow ?: return null
         val bounds = gestureEngine.getScreenBounds()
         val nodes = mutableListOf<ScreenNodeModel>()
+        val seenKeys = HashSet<String>(maxNodes)
         val pkgName = root.packageName?.toString() ?: _activePackageName.value.ifBlank { "unknown" }
 
         fun traverse(node: AccessibilityNodeInfo?, depth: Int) {
-            if (node == null || depth > 24 || nodes.size >= maxNodes) return
+            if (node == null || depth > 22 || nodes.size >= maxNodes) return
             if (!node.isVisibleToUser) return
 
             val rect = Rect()
             node.getBoundsInScreen(rect)
-            val hasValidBounds = rect.width() > 2 && rect.height() > 2
+            val inBounds = rect.width() > 6 &&
+                rect.height() > 6 &&
+                rect.right > 0 &&
+                rect.bottom > 0 &&
+                rect.left < bounds.widthPx &&
+                rect.top < bounds.heightPx
 
-            val text = node.text?.toString()?.trim().orEmpty().take(160)
-            val desc = node.contentDescription?.toString()?.trim().orEmpty().take(160)
+            val text = node.text?.toString()?.trim().orEmpty().take(120)
+            val desc = node.contentDescription?.toString()?.trim().orEmpty().take(120)
             val shortId = node.viewIdResourceName?.substringAfterLast("/")?.trim().orEmpty()
             val shortClass = node.className?.toString()?.substringAfterLast(".")?.trim().orEmpty()
 
-            val isInteractive = node.isClickable || node.isEditable || node.isScrollable || node.isCheckable
-            val hasContent = text.isNotEmpty() || desc.isNotEmpty()
+            val isPureContainer = shortClass.endsWith("Layout") ||
+                shortClass == "ViewGroup" ||
+                shortClass == "View" ||
+                shortClass == "FrameLayout" ||
+                shortClass == "LinearLayout" ||
+                shortClass == "RecyclerView"
 
-            if (hasValidBounds && (hasContent || isInteractive)) {
-                nodes.add(
-                    ScreenNodeModel(
-                        index = nodes.size,
-                        text = text,
-                        contentDescription = desc,
-                        viewId = shortId,
-                        className = shortClass,
-                        clickable = node.isClickable,
-                        editable = node.isEditable,
-                        scrollable = node.isScrollable,
-                        checked = node.isChecked,
-                        centerX = rect.centerX(),
-                        centerY = rect.centerY(),
-                        bounds = rect
+            val hasContent = text.isNotEmpty() || desc.isNotEmpty()
+            val isInputOrAction = node.isEditable || (node.isClickable && (!isPureContainer || hasContent))
+            val isActionableScroll = node.isScrollable && hasContent
+
+            if (inBounds && (hasContent || isInputOrAction || isActionableScroll)) {
+                val cx = rect.centerX().coerceIn(0, bounds.widthPx)
+                val cy = rect.centerY().coerceIn(0, bounds.heightPx)
+                val dedupKey = "${text.ifBlank { desc }}@${cx / 16}_${cy / 16}_${node.isEditable}"
+                if (seenKeys.add(dedupKey)) {
+                    nodes.add(
+                        ScreenNodeModel(
+                            index = nodes.size,
+                            text = text,
+                            contentDescription = desc,
+                            viewId = shortId,
+                            className = shortClass,
+                            clickable = node.isClickable,
+                            editable = node.isEditable,
+                            scrollable = node.isScrollable,
+                            checked = node.isChecked,
+                            centerX = cx,
+                            centerY = cy,
+                            bounds = rect
+                        )
                     )
-                )
+                }
             }
 
             for (i in 0 until node.childCount) {
@@ -221,7 +260,11 @@ class JarvisAccessibilityService : AccessibilityService() {
         return gestureEngine.swipeDirection(swipeDir)
     }
 
-    suspend fun typeText(text: String, targetFieldHint: String? = null): Boolean {
+    suspend fun typeText(
+        text: String,
+        targetFieldHint: String? = null,
+        submitAfterTyping: Boolean = false
+    ): Boolean {
         val root = rootInActiveWindow ?: return false
 
         val targetNode = when {
@@ -248,14 +291,21 @@ class JarvisAccessibilityService : AccessibilityService() {
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
-        if (targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
-            return true
+        var entered = targetNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+
+        if (!entered) {
+            // Clipboard fallback for custom input views that ignore ACTION_SET_TEXT
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.setPrimaryClip(ClipData.newPlainText("jarvis_input", text))
+            entered = targetNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
         }
 
-        // Clipboard fallback for custom input views that ignore ACTION_SET_TEXT
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newPlainText("jarvis_input", text))
-        return targetNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+        if (entered && submitAfterTyping && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching {
+                targetNode.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+            }
+        }
+        return entered
     }
 
     fun performGlobalSystemAction(actionName: String): Boolean {
@@ -376,5 +426,33 @@ class JarvisAccessibilityService : AccessibilityService() {
 
         private val _lastScreenSummary = MutableStateFlow("Awaiting screen scan…")
         val lastScreenSummary: StateFlow<String> = _lastScreenSummary.asStateFlow()
+
+        // Multi-step autonomous phone execution state & emergency stop latch
+        private val stopRequestedFlag = AtomicBoolean(false)
+
+        private val _isMultiStepRunning = MutableStateFlow(false)
+        val isMultiStepRunning: StateFlow<Boolean> = _isMultiStepRunning.asStateFlow()
+
+        private val _currentStepStatus = MutableStateFlow("")
+        val currentStepStatus: StateFlow<String> = _currentStepStatus.asStateFlow()
+
+        fun isStopRequested(): Boolean = stopRequestedFlag.get()
+
+        fun resetMultiStepSignal() {
+            stopRequestedFlag.set(false)
+        }
+
+        fun requestStopMultiStep() {
+            stopRequestedFlag.set(true)
+            _currentStepStatus.value = "Stopping autonomous execution…"
+        }
+
+        fun updateMultiStepStatus(running: Boolean, status: String = "") {
+            _isMultiStepRunning.value = running
+            _currentStepStatus.value = status
+            if (!running) {
+                stopRequestedFlag.set(false)
+            }
+        }
     }
 }

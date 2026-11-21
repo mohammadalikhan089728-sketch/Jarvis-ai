@@ -149,6 +149,8 @@ private fun JarvisRootApp(
     val permissions by viewModel.permissionsState.collectAsStateWithLifecycle()
     val keyVerification by viewModel.keyVerificationState.collectAsStateWithLifecycle()
     val screenSummary by viewModel.screenSummary.collectAsStateWithLifecycle()
+    val isMultiStepRunning by viewModel.isMultiStepRunning.collectAsStateWithLifecycle()
+    val multiStepStatus by viewModel.multiStepStatus.collectAsStateWithLifecycle()
     val activeVoiceLabel by viewModel.activeVoiceLabel.collectAsStateWithLifecycle()
     val lastVoiceStatus by viewModel.lastVoiceStatus.collectAsStateWithLifecycle()
 
@@ -224,6 +226,13 @@ private fun JarvisRootApp(
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
             Uri.parse("package:${context.packageName}")
         ).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        runCatching { context.startActivity(intent) }
+    }
+
+    fun openNotificationListenerSettings() {
+        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         runCatching { context.startActivity(intent) }
@@ -323,6 +332,8 @@ private fun JarvisRootApp(
                                 isLiveSessionActive = isLiveSessionActive,
                                 inactivityRemainingMs = inactivityRemainingMs,
                                 isAutoSleepStandby = isAutoSleepStandby,
+                                isMultiStepRunning = isMultiStepRunning,
+                                multiStepStatus = multiStepStatus,
                                 liveTranscript = liveTranscript,
                                 statusBanner = statusBanner,
                                 settings = settings,
@@ -336,6 +347,8 @@ private fun JarvisRootApp(
                                     }
                                 },
                                 onStopSpeech = viewModel::stopSpeaking,
+                                onStopMultiStep = viewModel::stopMultiStepAgent,
+                                onToggleAutoReply = viewModel::toggleAutoReplyMode,
                                 onSubmitCommand = viewModel::submitCommand,
                                 onClearHistory = viewModel::clearHistory,
                                 onOpenSettings = { navigateTopLevel(ROUTE_SETTINGS) },
@@ -362,6 +375,7 @@ private fun JarvisRootApp(
                                     micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                 },
                                 onOpenAccessibilitySettings = ::openAccessibilitySettings,
+                                onOpenNotificationListenerSettings = ::openNotificationListenerSettings,
                                 onOpenAppInfoSettings = ::openAppInfoSettings,
                                 onRequestOverlay = ::openOverlayPermissionSettings,
                                 onRequestCamera = {
@@ -387,11 +401,13 @@ private fun JarvisRootApp(
                                 activeVoiceLabel = activeVoiceLabel,
                                 lastVoiceStatus = lastVoiceStatus,
                                 overlayPermissionGranted = permissions.overlayGranted,
+                                notificationListenerGranted = permissions.notificationListenerActive,
                                 onSaveSettings = viewModel::saveSettings,
                                 onVerifyApiKey = viewModel::verifyGeminiApiKey,
                                 onResetVerification = viewModel::resetVerificationState,
                                 onTestVoice = viewModel::testVoice,
-                                onRequestOverlayPermission = ::openOverlayPermissionSettings
+                                onRequestOverlayPermission = ::openOverlayPermissionSettings,
+                                onOpenNotificationListenerSettings = ::openNotificationListenerSettings
                             )
                         }
                     }

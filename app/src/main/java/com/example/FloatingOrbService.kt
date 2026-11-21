@@ -9,13 +9,18 @@ import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.RadialGradient
 import android.graphics.Shader
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.TextView
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,6 +30,9 @@ class FloatingOrbService : Service() {
 
     private var windowManager: WindowManager? = null
     private var orbView: View? = null
+    private var stopHudView: View? = null
+    private var stopHudLabel: TextView? = null
+    private var persistentOrbRequested = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -33,29 +41,126 @@ class FloatingOrbService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (orbView == null) {
-            attachFloatingOrb()
+
+        when (intent?.action) {
+            ACTION_SHOW_STOP_HUD -> {
+                val status = intent.getStringExtra(EXTRA_STEP_STATUS).orEmpty()
+                showOrUpdateStopHud(status)
+            }
+            ACTION_HIDE_STOP_HUD -> {
+                removeStopHud()
+                if (!persistentOrbRequested && orbView == null) {
+                    stopSelf()
+                }
+            }
+            ACTION_STOP_ORB_ONLY -> {
+                persistentOrbRequested = false
+                removeOrb()
+                if (stopHudView == null) {
+                    stopSelf()
+                }
+            }
+            else -> {
+                persistentOrbRequested = true
+                if (orbView == null) {
+                    attachFloatingOrb()
+                }
+            }
         }
         return START_STICKY
     }
 
-    private fun attachFloatingOrb() {
-        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        windowManager = wm
-
-        val density = resources.displayMetrics.density
-        val sizePx = (62 * density).toInt()
-        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    private fun overlayWindowType(): Int {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
             @Suppress("DEPRECATION")
             WindowManager.LayoutParams.TYPE_PHONE
         }
+    }
+
+    private fun ensureWindowManager(): WindowManager {
+        return windowManager ?: (getSystemService(Context.WINDOW_SERVICE) as WindowManager).also {
+            windowManager = it
+        }
+    }
+
+    private fun showOrUpdateStopHud(stepStatus: String) {
+        val label = stepStatus.ifBlank { "JARVIS Autonomous Agent Active" }
+        stopHudLabel?.let { tv ->
+            tv.text = "■ STOP  •  $label"
+            return
+        }
+
+        val wm = ensureWindowManager()
+        val density = resources.displayMetrics.density
+        val padH = (16 * density).toInt()
+        val padV = (10 * density).toInt()
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(padH, padV, padH, padV)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 999f * density
+                setColor(Color.parseColor("#EB160812"))
+                setStroke((1.5f * density).toInt(), Color.parseColor("#FF2E54"))
+            }
+            elevation = 10f * density
+        }
+
+        val textView = TextView(this).apply {
+            text = "■ STOP  •  $label"
+            setTextColor(Color.parseColor("#FF5C7A"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            maxLines = 1
+        }
+        container.addView(textView)
+
+        container.setOnClickListener {
+            JarvisAccessibilityService.requestStopMultiStep()
+            removeStopHud()
+            if (!persistentOrbRequested && orbView == null) {
+                stopSelf()
+            }
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            y = (42 * density).toInt()
+        }
+
+        runCatching {
+            wm.addView(container, params)
+            stopHudView = container
+            stopHudLabel = textView
+        }
+    }
+
+    private fun removeStopHud() {
+        stopHudView?.let { v -> runCatching { windowManager?.removeView(v) } }
+        stopHudView = null
+        stopHudLabel = null
+    }
+
+    private fun attachFloatingOrb() {
+        val wm = ensureWindowManager()
+        val density = resources.displayMetrics.density
+        val sizePx = (62 * density).toInt()
 
         val params = WindowManager.LayoutParams(
             sizePx,
             sizePx,
-            overlayType,
+            overlayWindowType(),
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -93,7 +198,9 @@ class FloatingOrbService : Service() {
                     val duration = System.currentTimeMillis() - downTimeMs
                     if (dx < 16f && dy < 16f) {
                         if (duration >= 900L) {
-                            stopSelf()
+                            persistentOrbRequested = false
+                            removeOrb()
+                            if (stopHudView == null) stopSelf()
                         } else {
                             val launchIntent = Intent(this, MainActivity::class.java).apply {
                                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -113,15 +220,20 @@ class FloatingOrbService : Service() {
             orbView = view
             _isRunning.value = true
         }.onFailure {
-            stopSelf()
+            if (stopHudView == null) stopSelf()
         }
+    }
+
+    private fun removeOrb() {
+        orbView?.let { v -> runCatching { windowManager?.removeView(v) } }
+        orbView = null
+        _isRunning.value = false
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        orbView?.let { v -> runCatching { windowManager?.removeView(v) } }
-        orbView = null
-        _isRunning.value = false
+        removeOrb()
+        removeStopHud()
     }
 
     private class ArcOrbOverlayView(context: Context) : View(context) {
@@ -163,6 +275,10 @@ class FloatingOrbService : Service() {
 
     companion object {
         const val EXTRA_START_LISTENING = "com.example.jarvis.EXTRA_START_LISTENING"
+        private const val ACTION_SHOW_STOP_HUD = "com.example.jarvis.ACTION_SHOW_STOP_HUD"
+        private const val ACTION_HIDE_STOP_HUD = "com.example.jarvis.ACTION_HIDE_STOP_HUD"
+        private const val ACTION_STOP_ORB_ONLY = "com.example.jarvis.ACTION_STOP_ORB_ONLY"
+        private const val EXTRA_STEP_STATUS = "com.example.jarvis.EXTRA_STEP_STATUS"
 
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
@@ -176,7 +292,33 @@ class FloatingOrbService : Service() {
 
         fun stop(context: Context) {
             runCatching {
-                context.stopService(Intent(context, FloatingOrbService::class.java))
+                context.startService(
+                    Intent(context, FloatingOrbService::class.java).apply {
+                        action = ACTION_STOP_ORB_ONLY
+                    }
+                )
+            }
+        }
+
+        fun showStopHud(context: Context, stepStatus: String) {
+            if (!Settings.canDrawOverlays(context)) return
+            runCatching {
+                context.startService(
+                    Intent(context, FloatingOrbService::class.java).apply {
+                        action = ACTION_SHOW_STOP_HUD
+                        putExtra(EXTRA_STEP_STATUS, stepStatus)
+                    }
+                )
+            }
+        }
+
+        fun hideStopHud(context: Context) {
+            runCatching {
+                context.startService(
+                    Intent(context, FloatingOrbService::class.java).apply {
+                        action = ACTION_HIDE_STOP_HUD
+                    }
+                )
             }
         }
     }
