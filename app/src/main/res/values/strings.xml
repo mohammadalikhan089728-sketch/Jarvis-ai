@@ -1,0 +1,29 @@
+<resources>
+    <string name="app_name">Jarvis</string>
+    <string name="hud_title">J.A.R.V.I.S.</string>
+    <string name="hud_subtitle">JUST A RATHER VERY INTELLIGENT SYSTEM</string>
+    <string name="accessibility_service_label">Jarvis Screen &amp; Gesture Agent</string>
+    <string name="accessibility_service_description">Allows Jarvis to read on-screen UI elements and perform hands-free taps, scrolls, drags, multi-touch gestures, and text input when you issue voice or text commands.</string>
+    <string name="nav_hud">HUD</string>
+    <string name="nav_macros">Macros</string>
+    <string name="nav_permissions">Systems</string>
+    <string name="nav_settings">Config</string>
+    <string name="state_idle">STANDBY</string>
+    <string name="state_listening">LISTENING</string>
+    <string name="state_thinking">ANALYZING</string>
+    <string name="state_acting">EXECUTING</string>
+    <string name="state_speaking">VOCALIZING</string>
+    <string name="command_placeholder">Issue command to Jarvis…</string>
+    <string name="cd_arc_reactor">Tap Arc Reactor core to toggle voice listening</string>
+    <string name="cd_send_command">Send text command to Jarvis</string>
+    <string name="cd_mic_toggle">Toggle voice recognition microphone</string>
+    <string name="cd_stop_speech">Stop Jarvis speech output</string>
+    <string name="cd_open_settings">Open Jarvis configuration settings</string>
+    <string name="cd_open_permissions">Open system permissions checklist</string>
+    <string name="cd_hud_backdrop">Tactical HUD backdrop</string>
+    <string name="cd_toggle_key_visibility">Toggle Gemini API key visibility</string>
+    <string name="cd_delete_macro">Delete custom macro</string>
+    <string name="cd_run_macro">Run custom macro</string>
+    <string name="cd_clear_history">Clear local interaction logs</string>
+    <string name="cd_navigate_back">Navigate back</string>
+</resources>

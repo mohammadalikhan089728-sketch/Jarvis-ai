@@ -1,0 +1,6 @@
+{
+  "name": "Jarvis",
+  "description": "Voice-controlled personal AI agent with hands-free Android accessibility automation, local Room storage, customizable Master Prompt, realistic voice engine, and multi-touch gesture control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
