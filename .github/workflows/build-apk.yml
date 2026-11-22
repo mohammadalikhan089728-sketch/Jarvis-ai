@@ -90,7 +90,13 @@ jobs:
             exit 1
           fi
           echo "Temporary debug keystore verified at $KEYSTORE_PATH."
-
+      - name: Get SHA-1 Fingerprint
+        shell: bash
+        run: |
+          "$JAVA_HOME/bin/keytool" -list -v \
+            -keystore ./debug.keystore \
+            -storepass android \
+            -alias androiddebugkey | grep SHA1
       - name: Build debug APK
         shell: bash
         run: gradle :app:assembleDebug --stacktrace --no-daemon
