@@ -554,9 +554,50 @@ class YouTubeAuthAndApiClient(context: Context) {
             )
         }
 
-    private fun fetchAuthorizedRecentVideos(accessToken: String): Result<List<PublicVideoAnalytics>> {
+    /**
+     * Fetches the authenticated creator's latest uploaded YouTube videos using OAuth 2.0 YouTube Data API v3
+     * (ZERO Gemini API tokens used). Reused by both Gemini Live `get_youtube_channel_stats` tool and
+     * the periodic background `YouTubeMilestoneMonitorWorker`.
+     */
+    suspend fun fetchLatestAuthorizedVideos(maxResults: Int = 5): Result<List<PublicVideoAnalytics>> =
+        withContext(Dispatchers.IO) {
+            val token = ensureValidAccessToken().getOrElse { return@withContext Result.failure(it) }
+            fetchAuthorizedRecentVideos(token, maxResults.coerceIn(1, 10))
+        }
+
+    /**
+     * Fetches real-time verified channel statistics (subscribers, total views, video count) AND
+     * the latest uploaded videos' live performance in one OAuth 2.0 Data API v3 call sequence.
+     */
+    suspend fun fetchLiveChannelSnapshotWithLatestVideos(
+        maxVideos: Int = 5
+    ): Result<Pair<YouTubeChannelInfo, List<PublicVideoAnalytics>>> = withContext(Dispatchers.IO) {
+        val token = ensureValidAccessToken().getOrElse { return@withContext Result.failure(it) }
+        val channel = fetchAuthenticatedChannel(token).getOrElse { return@withContext Result.failure(it) }
+        // Keep encrypted vault stats fresh with the latest measured figures
+        val cfg = vault.loadConfig()
+        vault.saveConfig(
+            cfg.copy(
+                channelId = channel.channelId,
+                channelName = channel.title,
+                channelHandle = channel.handle,
+                channelThumbnailUrl = channel.thumbnailUrl,
+                subscriberCount = channel.subscriberCount,
+                totalViews = channel.totalViews,
+                videoCount = channel.videoCount
+            )
+        )
+        val latest = fetchAuthorizedRecentVideos(token, maxVideos.coerceIn(1, 10)).getOrDefault(emptyList())
+        Result.success(channel to latest)
+    }
+
+    private fun fetchAuthorizedRecentVideos(
+        accessToken: String,
+        maxResults: Int = 10
+    ): Result<List<PublicVideoAnalytics>> {
+        val safeMax = maxResults.coerceIn(1, 10)
         val searchReq = Request.Builder()
-            .url("$YT_DATA_BASE/search?part=id&forMine=true&type=video&order=date&maxResults=10")
+            .url("$YT_DATA_BASE/search?part=id&forMine=true&type=video&order=date&maxResults=$safeMax")
             .header("Authorization", "Bearer $accessToken")
             .get()
             .build()

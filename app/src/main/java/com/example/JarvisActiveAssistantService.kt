@@ -201,26 +201,117 @@ class JarvisActiveAssistantService : Service() {
         attachFloatingMiniBubbleIfPermitted()
         startInactivityWatchdog()
 
-        // Pre-warm the single persistent Multimodal Live WebSocket when AI Voice mode is active
-        serviceScope.launch {
-            val currentSettings = repository.getSettings()
-            if (currentSettings.voiceMode == VOICE_MODE_AI_VOICE &&
-                currentSettings.geminiApiKey.isNotBlank() &&
-                !PersistentLiveAudioSession.isInQuotaCooldown()
-            ) {
-                PersistentLiveAudioSession.ensureConnected(
-                    rawApiKey = currentSettings.geminiApiKey,
-                    voiceName = currentSettings.aiVoiceName.ifBlank { AI_VOICE_CHARON },
-                    masterSystemPrompt = currentSettings.masterSystemPrompt
-                )
+        // Start real-time native audio-to-audio WebSocket streaming (16kHz PCM in / 24kHz PCM out, Puck voice)
+        // when "With AI Voice" mode is active; falls back cleanly to SpeechRecognizer + Normal Neural TTS if offline.
+        if (!initialCommand.isNullOrBlank()) {
+            serviceScope.launch {
+                val currentSettings = repository.getSettings()
+                if (currentSettings.voiceMode == VOICE_MODE_AI_VOICE &&
+                    currentSettings.geminiApiKey.isNotBlank() &&
+                    !PersistentLiveAudioSession.isInQuotaCooldown()
+                ) {
+                    PersistentLiveAudioSession.ensureConnected(
+                        rawApiKey = currentSettings.geminiApiKey,
+                        voiceName = currentSettings.aiVoiceName.ifBlank { AI_VOICE_PUCK },
+                        masterSystemPrompt = currentSettings.masterSystemPrompt,
+                        context = applicationContext
+                    )
+                }
+                submitCommandInternal(initialCommand)
+            }
+        } else {
+            serviceScope.launch {
+                val currentSettings = repository.getSettings()
+                val canUseNativeLive = currentSettings.voiceMode == VOICE_MODE_AI_VOICE &&
+                    currentSettings.geminiApiKey.isNotBlank() &&
+                    !PersistentLiveAudioSession.isInQuotaCooldown()
+
+                if (canUseNativeLive) {
+                    _statusBanner.value = "Connecting Live Native Audio…"
+                    val startedNative = startNativeLiveAudioLoop(currentSettings)
+                    if (startedNative) {
+                        return@launch
+                    }
+                }
+                // Fallback to SpeechRecognizer + Neural TTS when offline or Normal Voice mode is selected
+                beginRecognitionWindow()
             }
         }
+    }
 
-        if (!initialCommand.isNullOrBlank()) {
-            submitCommandInternal(initialCommand)
-        } else {
-            beginRecognitionWindow()
+    private suspend fun startNativeLiveAudioLoop(settings: SettingsEntity): Boolean {
+        val voice = settings.aiVoiceName.ifBlank { AI_VOICE_PUCK }
+        var lastUserUtterance = ""
+        val ok = PersistentLiveAudioSession.startNativeAudioStreaming(
+            context = applicationContext,
+            rawApiKey = settings.geminiApiKey,
+            voiceName = voice,
+            masterSystemPrompt = settings.masterSystemPrompt,
+            callbacks = object : LiveAudioCallbacks {
+                override fun onUserTranscript(text: String) {
+                    if (text.isNotBlank()) {
+                        lastUserUtterance = text
+                        markSpeechActivity()
+                        _liveTranscript.value = text
+                        if (isStopListeningCommand(text)) {
+                            mainHandler.post { stopSessionAndSelf(speakGoodbye = true) }
+                        }
+                    }
+                }
+
+                override fun onJarvisTranscript(text: String, isTurnComplete: Boolean) {
+                    markSpeechActivity()
+                    if (isTurnComplete && text.isNotBlank()) {
+                        _statusBanner.value = "LIVE AUDIO ($voice) • Ready"
+                        serviceScope.launch {
+                            repository.logInteraction(
+                                ChatHistoryEntity(
+                                    userTranscript = lastUserUtterance.ifBlank { "[Voice Audio]" },
+                                    executedAction = "JARVIS:LIVE_AUDIO",
+                                    actionParamsJson = "{}",
+                                    jarvisReply = text,
+                                    isOffline = false,
+                                    latencyMs = 0L
+                                )
+                            )
+                            lastUserUtterance = ""
+                        }
+                    }
+                }
+
+                override fun onPhaseChanged(phase: JarvisPhase) {
+                    _phase.value = phase
+                    _statusBanner.value = when (phase) {
+                        JarvisPhase.LISTENING -> "LIVE AUDIO ($voice) • Listening…"
+                        JarvisPhase.ACTING -> "LIVE AUDIO • Running Tool…"
+                        JarvisPhase.SPEAKING -> "LIVE AUDIO ($voice) • Speaking…"
+                        JarvisPhase.THINKING -> "LIVE AUDIO • Thinking…"
+                        JarvisPhase.IDLE -> "STANDBY"
+                    }
+                }
+
+                override fun onVoiceRmsChanged(rmsDb: Float) {
+                    _voiceRmsDb.value = rmsDb
+                }
+
+                override fun onToolExecuting(toolName: String) {
+                    _statusBanner.value = "Executing tool: $toolName"
+                }
+
+                override fun onAutoDisconnected(reason: String) {
+                    mainHandler.post {
+                        if (_isSessionActive.value) {
+                            triggerAutoSleep()
+                        }
+                    }
+                }
+            }
+        )
+        if (ok) {
+            _phase.value = JarvisPhase.LISTENING
+            _statusBanner.value = "LIVE AUDIO ($voice) • Listening…"
         }
+        return ok
     }
 
     private fun stopSessionAndSelf(speakGoodbye: Boolean) {
@@ -234,6 +325,7 @@ class JarvisActiveAssistantService : Service() {
 
         _isSessionActive.value = false
         _inactivityRemainingMs.value = 0L
+        PersistentLiveAudioSession.stopNativeAudioStreaming(releaseMicOwner = true)
         stopRecognizerWindowOnly()
         destroySpeechRecognizer()
         removeFloatingMiniBubble()
@@ -245,7 +337,7 @@ class JarvisActiveAssistantService : Service() {
                 val settings = repository.getSettings()
                 _phase.value = JarvisPhase.SPEAKING
                 _statusBanner.value = "STANDBY"
-                voiceEngine.speak("Standing by, sir.", settings) {
+                voiceEngine.speak("Standing by, Boss.", settings) {
                     PersistentLiveAudioSession.closeSession("Session ended")
                     _phase.value = JarvisPhase.IDLE
                     stopForegroundCompat()
@@ -270,6 +362,7 @@ class JarvisActiveAssistantService : Service() {
         activeCommandJob?.cancel()
         activeCommandJob = null
 
+        PersistentLiveAudioSession.stopNativeAudioStreaming(releaseMicOwner = true)
         stopRecognizerWindowOnly()
         destroySpeechRecognizer()
         _isSessionActive.value = false
@@ -527,6 +620,7 @@ class JarvisActiveAssistantService : Service() {
         if (clean.isEmpty()) return
 
         restartListeningJob?.cancel()
+        PersistentLiveAudioSession.stopNativeAudioStreaming(releaseMicOwner = false)
         stopRecognizerWindowOnly()
         MicCoordinator.release(MicOwner.ACTIVE_ASSISTANT)
         _isAutoSleepStandby.value = false
@@ -583,7 +677,19 @@ class JarvisActiveAssistantService : Service() {
     private fun handlePostSpeechTurnTaking() {
         if (_isSessionActive.value) {
             markSpeechActivity()
-            scheduleLiveRestart(MicCoordinator.POST_SPEECH_RESTART_DELAY_MS)
+            serviceScope.launch {
+                val currentSettings = repository.getSettings()
+                val canResumeNative = currentSettings.voiceMode == VOICE_MODE_AI_VOICE &&
+                    currentSettings.geminiApiKey.isNotBlank() &&
+                    !PersistentLiveAudioSession.isInQuotaCooldown()
+                if (canResumeNative) {
+                    delay(MicCoordinator.POST_SPEECH_RESTART_DELAY_MS)
+                    if (_isSessionActive.value && startNativeLiveAudioLoop(currentSettings)) {
+                        return@launch
+                    }
+                }
+                scheduleLiveRestart(MicCoordinator.POST_SPEECH_RESTART_DELAY_MS)
+            }
         } else {
             _phase.value = JarvisPhase.IDLE
         }

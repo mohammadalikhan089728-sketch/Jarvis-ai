@@ -101,22 +101,73 @@ object YouTubeMilestoneMonitorScheduler {
             .sorted()
     }
 
+    /**
+     * Pure helper for detecting significant view spikes (e.g., every +100 or +1,000 new views)
+     * when a video has already passed its explicit milestone list.
+     */
+    fun detectViewSpikeMilestone(
+        previousViews: Long,
+        currentViews: Long,
+        spikeStep: Long
+    ): Long? {
+        if (spikeStep <= 0L || currentViews <= previousViews || previousViews <= 0L) return null
+        val prevBucket = previousViews / spikeStep
+        val currBucket = currentViews / spikeStep
+        return if (currBucket > prevBucket) currBucket * spikeStep else null
+    }
+
+    /**
+     * Runs a lightweight background check using YouTube Data API v3 directly (ZERO Gemini API tokens!).
+     * 1. Auto-discovers and registers the connected channel's latest uploaded video(s) when OAuth is connected.
+     * 2. Fetches fresh view counts in 1 batched YouTube Data API v3 call.
+     * 3. Triggers the existing JARVIS incoming voice call alert immediately when any milestone or view spike is crossed.
+     */
     suspend fun runSingleCheckNow(context: Context): kotlin.Result<MilestoneCheckSummary> {
         val appContext = context.applicationContext
         val repo = JarvisRepository(JarvisDatabase.getInstance(appContext))
         val vault = SecureCredentialVault.getInstance(appContext)
         val cfg = vault.loadConfig()
+        val ytClient = YouTubeAuthAndApiClient(appContext)
+
+        // Auto-discover latest uploaded channel video(s) using YouTube Data API v3 directly (0 Gemini tokens!)
+        if (cfg.isAccountAuthorized) {
+            ytClient.fetchLatestAuthorizedVideos(maxResults = 3).onSuccess { latestList ->
+                for (latest in latestList) {
+                    val existing = repo.getMonitoredVideoById(latest.videoId)
+                    if (existing == null) {
+                        // Seed already-passed milestones on first discovery so old views don't fire stale alerts
+                        val preReached = cfg.parsedMilestones()
+                            .filter { latest.views >= it }
+                            .joinToString(",")
+                        repo.upsertMonitoredVideo(
+                            MonitoredYouTubeVideoEntity(
+                                videoId = latest.videoId,
+                                title = latest.title,
+                                thumbnailUrl = latest.thumbnailUrl,
+                                channelId = latest.channelId,
+                                previousViews = latest.views,
+                                currentViews = latest.views,
+                                currentLikes = latest.likes,
+                                currentComments = latest.comments,
+                                reachedMilestonesCsv = preReached,
+                                lastCheckedAt = System.currentTimeMillis()
+                            )
+                        )
+                    }
+                }
+            }
+        }
 
         val monitored = repo.getActiveMonitoredVideos()
         if (monitored.isEmpty()) {
             return kotlin.Result.success(MilestoneCheckSummary(0, 0, "No monitored videos registered yet."))
         }
 
-        val ytClient = YouTubeAuthAndApiClient(appContext)
         val statsRes = ytClient.fetchBatchVideoStats(monitored.map { it.videoId })
         val statsMap = statsRes.getOrElse { return kotlin.Result.failure(it) }
 
         val thresholds = cfg.parsedMilestones()
+        val spikeStep = thresholds.firstOrNull()?.coerceAtLeast(100L) ?: 100L
         var triggeredCount = 0
 
         for (video in monitored) {
@@ -128,16 +179,27 @@ object YouTubeMilestoneMonitorScheduler {
 
             val newlyCrossed = detectNewCrossedMilestones(fresh.views, thresholds, reachedSet)
             val growthDelta = (fresh.views - video.currentViews).coerceAtLeast(0L)
+            val spikeHit = if (newlyCrossed.isEmpty() && thresholds.isNotEmpty() && fresh.views > thresholds.max()) {
+                detectViewSpikeMilestone(video.currentViews, fresh.views, spikeStep)
+            } else null
 
-            if (newlyCrossed.isNotEmpty()) {
-                // Mark ALL newly crossed thresholds as reached immediately so duplicate calls NEVER fire
-                reachedSet.addAll(newlyCrossed)
-                val highestMilestone = newlyCrossed.max()
+            val alertMilestone: Long? = when {
+                newlyCrossed.isNotEmpty() -> {
+                    reachedSet.addAll(newlyCrossed)
+                    newlyCrossed.max()
+                }
+                spikeHit != null && spikeHit !in reachedSet -> {
+                    reachedSet.add(spikeHit)
+                    spikeHit
+                }
+                else -> null
+            }
+
+            if (alertMilestone != null) {
                 triggeredCount++
-
                 val milestoneMessage = buildMilestoneBriefing(
                     videoTitle = fresh.title,
-                    milestone = highestMilestone,
+                    milestone = alertMilestone,
                     currentViews = fresh.views,
                     growthDelta = growthDelta
                 )
@@ -145,7 +207,7 @@ object YouTubeMilestoneMonitorScheduler {
                 // Record alert in existing local call-alert table
                 repo.addPendingCallAlert(
                     PendingCallAlertEntity(
-                        title = "YouTube Milestone: ${formatCount(highestMilestone)} Views",
+                        title = "YouTube Milestone: ${formatCount(alertMilestone)} Views",
                         summary = milestoneMessage,
                         sourceApp = "YouTube",
                         alertCategory = ALERT_CATEGORY_VIRAL,
@@ -158,7 +220,7 @@ object YouTubeMilestoneMonitorScheduler {
                     config = cfg,
                     videoId = video.videoId,
                     videoTitle = fresh.title,
-                    milestone = highestMilestone,
+                    milestone = alertMilestone,
                     briefingText = milestoneMessage
                 )
             }
@@ -183,7 +245,7 @@ object YouTubeMilestoneMonitorScheduler {
             )
         }
 
-        val summaryText = "Checked ${monitored.size} monitored video(s); $triggeredCount new milestone(s) triggered."
+        val summaryText = "Checked ${monitored.size} video(s) via YouTube Data API v3 (0 AI tokens); $triggeredCount milestone alert(s) triggered."
         return kotlin.Result.success(MilestoneCheckSummary(monitored.size, triggeredCount, summaryText))
     }
 
@@ -195,8 +257,8 @@ object YouTubeMilestoneMonitorScheduler {
     ): String {
         val mStr = formatCount(milestone)
         val vStr = formatCount(currentViews)
-        val growthNote = if (growthDelta > 0L) " (+${formatCount(growthDelta)} since last check)" else ""
-        return "Sir, your video \"$videoTitle\" has crossed $mStr views and now has $vStr views$growthNote. Its performance is improving. I have content and SEO strategy suggestions for your next upload — would you like to discuss them?"
+        val growthNote = if (growthDelta > 0L) " (+${formatCount(growthDelta)} new views)" else ""
+        return "Boss, your latest video \"$videoTitle\" just crossed $mStr views and is now at $vStr views$growthNote! Would you like to check analytics or plan the next upload?"
     }
 
     private fun dispatchMilestoneAlertOrInAppCall(

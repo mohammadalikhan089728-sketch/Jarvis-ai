@@ -25,7 +25,8 @@ const val VOICE_MODE_CUSTOM_URL = "CUSTOM_URL"
 const val ENGINE_V25_LITE = "CORE_V25"
 const val ENGINE_V35_DEEP = "CORE_V35"
 
-// Selectable Male AI Voices
+// Selectable Real-Time AI Voices (Default: Puck)
+const val AI_VOICE_PUCK = "Puck"
 const val AI_VOICE_CHARON = "Charon"
 const val AI_VOICE_ORUS = "Orus"
 const val AI_VOICE_FENRIR = "Fenrir"
@@ -76,18 +77,19 @@ const val JARVIS_IDENTITY_REPLY =
 val DEFAULT_MASTER_PROMPT = """
 You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), created and developed by Mozahid.
 Treat Mozahid exactly like Tony Stark was to J.A.R.V.I.S. — your creator, boss, and architect.
-Personality & Style:
-- Always reply in crisp, natural Hinglish (1-2 short spoken sentences, ZERO markdown, brackets, asterisks, or bullet lists).
-- Address Mozahid respectfully ("Sir" or "Boss") with calm, sharp, Stark-style intelligence.
+Personality & Speech Rules:
+- Keep every reply concise (1 to 3 natural spoken sentences) unless the user explicitly asks for deep detail.
+- Automatically respond in the user's language (Hindi, Hinglish, or English) with zero markdown, brackets, asterisks, or bullet lists.
+- Address Mozahid respectfully ("Boss" or "Sir") with calm, sharp, Stark-style intelligence.
 - Whenever asked "Tum kaun ho?", "Tumhe kisne banaya?", "Kya tum Gemini ho?", or "Kaunsa model ho?", ALWAYS reply verbatim:
   "$JARVIS_IDENTITY_REPLY"
 - Never claim to be any external AI brand or model.
 
-Command Priorities:
-1. For phone control or automation tasks, inspect the compact screen UI JSON and select exact element text or center (x, y) coordinates.
-2. Prefer TAP_TEXT when a clear label exists, or TAP_XY / LONG_PRESS_XY / SWIPE / DRAG / MULTI_TOUCH when geometric precision is needed.
-3. For multi-step workflows (WhatsApp message, Instagram DM/Reels, YouTube play, System Settings), execute step-by-step and return "DONE" once fulfilled.
-4. Keep spoken replies brief, natural Hinglish confirmations.
+Strict Tool-First & Zero-Fabrication Rules:
+1. NEVER fabricate or guess screen contents, app state, or YouTube channel/video statistics. Always call the corresponding tool FIRST and report only verified tool results.
+2. Token-Saving Lazy Screen Reading: NEVER assume what is on screen. Call `ui_read` ONLY when the user explicitly asks about the screen ("what's on my screen", "read this", "click on X", etc.).
+3. Always execute the required tool (`ui_action`, `youtube_search_play`, `get_youtube_channel_stats`, `upload_youtube_video`, `trigger_jarvis_call`) BEFORE confirming that an action is done.
+4. For any YouTube channel question (subscribers, total views, latest video performance, upload status), ALWAYS call `get_youtube_channel_stats` first.
 """.trimIndent()
 
 @Entity(tableName = "jarvis_settings")
@@ -95,19 +97,19 @@ data class SettingsEntity(
     @PrimaryKey val id: Int = 1,
     val geminiApiKey: String = "",
     val masterSystemPrompt: String = DEFAULT_MASTER_PROMPT,
-    val voiceMode: String = VOICE_MODE_NORMAL,
+    val voiceMode: String = VOICE_MODE_AI_VOICE,
     val customVoiceUrl: String = "",
     val voicePitch: Float = 0.92f,
     val voiceSpeed: Float = 1.02f,
     val wakeWordEnabled: Boolean = false,
-    val autoReadScreenContext: Boolean = true,
+    val autoReadScreenContext: Boolean = false,
     val floatingOverlayEnabled: Boolean = false,
     val offlineFirstMode: Boolean = true,
     val autoReplyEnabled: Boolean = false,
     val autoReplyTargetContact: String = "",
     val customWakeWord: String = "Jarvis",
     val alwaysOnWakeWordEnabled: Boolean = false,
-    val aiVoiceName: String = AI_VOICE_CHARON,
+    val aiVoiceName: String = AI_VOICE_PUCK,
     val onlineAutoCallEnabled: Boolean = true,
     val coreEngine: String = ENGINE_V25_LITE,
     val updatedAt: Long = System.currentTimeMillis()

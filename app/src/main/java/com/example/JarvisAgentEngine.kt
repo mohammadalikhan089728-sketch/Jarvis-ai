@@ -236,11 +236,12 @@ class JarvisAgentEngine(
             return res
         }
 
-        // 8. Pure Conversational Q&A:
-        //    - When "With AI Voice" is active, route directly through the ONE persistent Live Audio WebSocket
-        //      (zero REST generateContent loop, zero screen JSON, instant deep male audio + clean transcript).
-        //    - Otherwise (or if Live Audio is unavailable/in cooldown), use ultra-fast streaming TTS.
-        if (isPureConversationalQuery(normalizedLower)) {
+        // 8. Single Persistent Multimodal Live WebSocket Routing (ZERO repetitive REST loops, ZERO auto screen tree!):
+        //    - Routes normal conversation AND YouTube channel/upload/screen tool requests directly through
+        //      ONE persistent Live WebSocket (`gemini-3.1-flash-live-preview`, voice "Puck") with registered
+        //      tools (`ui_read`, `ui_action`, `get_youtube_channel_stats`, `upload_youtube_video`, etc.).
+        //    - Screen tree is NEVER read or attached automatically; model calls `ui_read` lazily ONLY when asked.
+        if (isPureConversationalQuery(normalizedLower) || isYouTubeCreatorToolQuery(normalizedLower)) {
             onPhaseUpdate(JarvisPhase.THINKING)
             val baseMemory = memoryManager.buildCompactMemoryContext(query)
             val projectMemory = intelligenceModules.buildActiveProjectContextBlock()
@@ -251,18 +252,27 @@ class JarvisAgentEngine(
                 val liveResult = PersistentLiveAudioSession.sendConversationalTurn(
                     rawApiKey = settings.geminiApiKey,
                     userText = query,
-                    voiceName = settings.aiVoiceName.ifBlank { AI_VOICE_CHARON },
+                    voiceName = settings.aiVoiceName.ifBlank { AI_VOICE_PUCK },
                     masterSystemPrompt = settings.masterSystemPrompt,
-                    memoryContext = memoryContext
+                    memoryContext = memoryContext,
+                    context = appContext
                 )
                 if (liveResult.isSuccess) {
                     val turn = liveResult.getOrThrow()
                     val cleanTranscript = JarvisResponseSanitizer.extractCleanReply(turn.spokenTranscript)
-                        .ifBlank { "Ji Sir, jawab de diya hai." }
+                        .ifBlank { "Done Boss." }
                     val elapsed = System.currentTimeMillis() - startMs
+                    val toolsTag = if (turn.toolsExecuted.isNotEmpty()) {
+                        "JARVIS:LIVE_TOOLS(${turn.toolsExecuted.joinToString(",")})"
+                    } else {
+                        "JARVIS:LIVE_AUDIO"
+                    }
                     val res = AgentExecutionResult(
-                        executedAction = "JARVIS:LIVE_AUDIO",
-                        paramsJson = JSONObject().put("chunks", turn.pcmChunksPlayed).toString(),
+                        executedAction = toolsTag,
+                        paramsJson = JSONObject()
+                            .put("chunks", turn.pcmChunksPlayed)
+                            .put("tools", turn.toolsExecuted.joinToString(","))
+                            .toString(),
                         reply = cleanTranscript,
                         isOffline = false,
                         latencyMs = elapsed,
@@ -277,7 +287,7 @@ class JarvisAgentEngine(
                     val res = AgentExecutionResult(
                         executedAction = "JARVIS:QUOTA_COOLDOWN",
                         paramsJson = "{}",
-                        reply = "Rate limit cooldown active hai Sir (${PersistentLiveAudioSession.remainingCooldownSeconds()}s). Offline commands aur device controls abhi bhi kaam kar rahe hain.",
+                        reply = "Rate limit cooldown active hai Boss (${PersistentLiveAudioSession.remainingCooldownSeconds()}s). Offline commands aur device controls abhi bhi kaam kar rahe hain.",
                         isOffline = true,
                         latencyMs = elapsed,
                         alreadyStreamSpoken = false
@@ -455,7 +465,12 @@ class JarvisAgentEngine(
                 FloatingOrbService.showStopHud(appContext, statusLabel)
                 onStatusUpdate(statusLabel)
 
-                val screenContextJson = if (settings.autoReadScreenContext) {
+                // Token-Saving Lazy Screen Reading: only read screen hierarchy if the user explicitly
+                // asked to inspect/click screen elements or enabled auto-read for multi-step UI navigation.
+                val needsScreenForStep = settings.autoReadScreenContext ||
+                    step > 1 ||
+                    explicitlyReferencesScreen(goalQuery.lowercase(Locale.ROOT))
+                val screenContextJson = if (needsScreenForStep) {
                     JarvisAccessibilityService.instance?.readScreenHierarchy()?.toCompactJson()
                 } else {
                     null
@@ -854,6 +869,34 @@ class JarvisAgentEngine(
                 )
             }
         )
+    }
+
+    private fun isYouTubeCreatorToolQuery(lower: String): Boolean {
+        val mentionsCreator = lower.contains("subscriber") ||
+            lower.contains("subscribers") ||
+            lower.contains("channel stats") ||
+            lower.contains("my channel") ||
+            lower.contains("mera channel") ||
+            lower.contains("latest video") ||
+            lower.contains("video views") ||
+            lower.contains("kitne view") ||
+            lower.contains("how many views") ||
+            lower.contains("upload video") ||
+            lower.contains("upload a video") ||
+            lower.contains("upload short") ||
+            lower.contains("upload my clip") ||
+            lower.contains("upload status")
+        return mentionsCreator && (lower.contains("youtube") || lower.contains("channel") || lower.contains("video") || lower.contains("subscriber") || lower.contains("view") || lower.contains("clip") || lower.contains("short"))
+    }
+
+    private fun explicitlyReferencesScreen(lower: String): Boolean {
+        return lower.contains("screen") ||
+            lower.contains("click ") ||
+            lower.contains("tap ") ||
+            lower.contains("read this") ||
+            lower.contains("what's on") ||
+            lower.contains("what is on") ||
+            lower.contains("kya likha")
     }
 
     private fun isPureConversationalQuery(lower: String): Boolean {

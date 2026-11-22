@@ -391,4 +391,105 @@ class JarvisUpgradeVerificationTest {
         assertTrue(edgeId > 0L)
         assertEquals(2, repo.getKnowledgeNodes().size)
     }
+
+    // -------------------------------------------------------------------------
+    // 7. GEMINI 3.1 FLASH LIVE PREVIEW WEBSOCKET, PUCK VOICE & TOOL CALLING TESTS
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun `live websocket uses exact BidiGenerateContent endpoint x-goog-api-key header gemini-3-1-flash-live-preview and Puck voice`() {
+        val req = PersistentLiveAudioSession.buildWebSocketRequest("test-gemini-key-xyz")
+        assertEquals(
+            "https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
+            req.url.toString()
+        )
+        assertEquals("test-gemini-key-xyz", req.header("x-goog-api-key"))
+        assertNull("API key must NOT be leaked in query parameters", req.url.queryParameter("key"))
+
+        assertEquals("models/gemini-3.1-flash-live-preview", PersistentLiveAudioSession.LIVE_MODEL_ID)
+        assertEquals(16_000, PersistentLiveAudioSession.INPUT_SAMPLE_RATE_HZ)
+        assertEquals(24_000, PersistentLiveAudioSession.OUTPUT_SAMPLE_RATE_HZ)
+        assertEquals(180_000L, PersistentLiveAudioSession.INACTIVITY_DISCONNECT_MS)
+        assertEquals("Puck", PersistentLiveAudioSession.resolveVoiceName(""))
+        assertEquals("Puck", PersistentLiveAudioSession.resolveVoiceName("Puck"))
+
+        val setupJson = org.json.JSONObject(
+            PersistentLiveAudioSession.buildSetupFrame(
+                voiceName = AI_VOICE_PUCK,
+                youtubeChannelContext = "CONNECTED YOUTUBE CHANNEL (OAuth 2.0 Verified): Mozahid Lab (@mozahid)"
+            )
+        )
+        val setup = setupJson.getJSONObject("setup")
+        assertEquals("models/gemini-3.1-flash-live-preview", setup.getString("model"))
+
+        val voiceName = setup
+            .getJSONObject("generationConfig")
+            .getJSONObject("speechConfig")
+            .getJSONObject("voiceConfig")
+            .getJSONObject("prebuiltVoiceConfig")
+            .getString("voiceName")
+        assertEquals("Puck", voiceName)
+
+        // Verify all required function declarations are registered inside setup.tools
+        val decls = setup.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
+        val names = (0 until decls.length()).map { decls.getJSONObject(it).getString("name") }.toSet()
+        assertTrue("ui_read" in names)
+        assertTrue("ui_action" in names)
+        assertTrue("youtube_search_play" in names)
+        assertTrue("get_youtube_channel_stats" in names)
+        assertTrue("upload_youtube_video" in names)
+        assertTrue("trigger_jarvis_call" in names)
+
+        // Verify system instruction enforces lazy screen reading & channel awareness
+        val sysText = setup.getJSONObject("systemInstruction")
+            .getJSONArray("parts")
+            .getJSONObject(0)
+            .getString("text")
+        assertTrue(sysText.contains("ui_read"))
+        assertTrue(sysText.contains("Mozahid Lab"))
+
+        // Verify 16kHz PCM realtime audio frame & toolResponse frame structure
+        val audioFrame = org.json.JSONObject(
+            PersistentLiveAudioSession.buildRealtimeAudioFrame(byteArrayOf(0x01, 0x02, 0x03, 0x04))
+        )
+        val chunk = audioFrame.getJSONObject("realtimeInput").getJSONArray("mediaChunks").getJSONObject(0)
+        assertEquals("audio/pcm;rate=16000", chunk.getString("mimeType"))
+        assertTrue(chunk.getString("data").isNotBlank())
+
+        // Verify SettingsEntity defaults: AI Voice + Puck + lazy screen reading (autoReadScreenContext = false)
+        val defaultSettings = SettingsEntity()
+        assertEquals(VOICE_MODE_AI_VOICE, defaultSettings.voiceMode)
+        assertEquals(AI_VOICE_PUCK, defaultSettings.aiVoiceName)
+        assertFalse("Screen reading must be lazy (off by default on normal turns)", defaultSettings.autoReadScreenContext)
+    }
+
+    @Test
+    fun `live tool executor handles lazy ui_read and unauthenticated youtube stats safely plus view spike detection`() = runBlocking {
+        // Lazy ui_read returns structured error gracefully when Accessibility Service is not running in Robolectric
+        val uiRes = JarvisLiveToolRegistry.executeToolCall(
+            context,
+            JarvisLiveToolRegistry.TOOL_UI_READ,
+            org.json.JSONObject()
+        )
+        assertFalse(uiRes.getBoolean("ok"))
+        assertTrue(uiRes.getString("error").contains("Accessibility", ignoreCase = true))
+
+        // View spike detection works cleanly for +100 and +1,000 view increments without duplicates
+        assertEquals(
+            1_100L,
+            YouTubeMilestoneMonitorScheduler.detectViewSpikeMilestone(previousViews = 1_040L, currentViews = 1_125L, spikeStep = 100L)
+        )
+        assertNull(
+            YouTubeMilestoneMonitorScheduler.detectViewSpikeMilestone(previousViews = 1_125L, currentViews = 1_180L, spikeStep = 100L)
+        )
+        val briefing = YouTubeMilestoneMonitorScheduler.buildMilestoneBriefing(
+            videoTitle = "JARVIS Live Demo",
+            milestone = 1_000L,
+            currentViews = 1_042L,
+            growthDelta = 120L
+        )
+        assertTrue(briefing.contains("Boss, your latest video"))
+        assertTrue(briefing.contains("1,000 views"))
+    }
 }
+

@@ -359,18 +359,19 @@ class VoiceEngineManager(
 
         if (isAiVoiceMode(settings) && !PersistentLiveAudioSession.isInQuotaCooldown()) {
             setSpeakingState(true)
-            val chosenVoice = settings.aiVoiceName.ifBlank { AI_VOICE_CHARON }
-            _lastVoiceStatus.value = "Single Live AI Voice ($chosenVoice)"
+            val chosenVoice = settings.aiVoiceName.ifBlank { AI_VOICE_PUCK }
+            _lastVoiceStatus.value = "Live Native Voice ($chosenVoice)"
             aiVoiceJob = scope.launch {
                 val res = PersistentLiveAudioSession.speakVerbatim(
                     rawApiKey = settings.geminiApiKey,
                     textToSpeak = cleanText,
-                    voiceName = chosenVoice
+                    voiceName = chosenVoice,
+                    context = context
                 )
                 if (res.isSuccess) {
                     dispatchSpeechFinished(expectedUtteranceId = null)
                 } else {
-                    _lastVoiceStatus.value = "Live Audio paused — using Neural Normal Voice"
+                    _lastVoiceStatus.value = "Live Audio offline — using Neural Normal Voice"
                     speakWithSystemTts(cleanText, effectiveNormalPitch(settings), settings.voiceSpeed)
                 }
             }

@@ -151,10 +151,10 @@ class GeminiApiClient {
         const val MODEL_V25_LITE = "gemini-2.5-flash-lite"
         const val MODEL_V25_FLASH = "gemini-2.5-flash"
         const val MODEL_V35_FLASH = "gemini-3.5-flash"
-        const val LIVE_AUDIO_MODEL_NAME = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+        const val LIVE_AUDIO_MODEL_NAME = "models/gemini-3.1-flash-live-preview"
 
         private const val API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-        private const val BIDI_LIVE_WS_BASE_URL =
+        const val BIDI_LIVE_WS_BASE_URL =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
@@ -280,7 +280,7 @@ class GeminiApiClient {
     suspend fun streamLiveAiVoice(
         rawApiKey: String,
         textToSpeak: String,
-        voiceName: String = AI_VOICE_CHARON,
+        voiceName: String = AI_VOICE_PUCK,
         onPcmChunk: (pcmBytes: ByteArray, sampleRateHz: Int) -> Unit
     ): Result<Int> = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
@@ -290,12 +290,12 @@ class GeminiApiClient {
         }
 
         val resolvedVoice = when (voiceName.trim()) {
+            AI_VOICE_CHARON -> AI_VOICE_CHARON
             AI_VOICE_ORUS -> AI_VOICE_ORUS
             AI_VOICE_FENRIR -> AI_VOICE_FENRIR
-            else -> AI_VOICE_CHARON
+            else -> AI_VOICE_PUCK
         }
-        val encodedKey = URLEncoder.encode(apiKey, "UTF-8")
-        val wsUrl = "$BIDI_LIVE_WS_BASE_URL?key=$encodedKey"
+        val wsUrl = BIDI_LIVE_WS_BASE_URL
 
         val completion = CompletableDeferred<Result<Int>>()
         val setupSent = AtomicBoolean(false)
@@ -427,7 +427,10 @@ class GeminiApiClient {
             }
         }
 
-        val request = Request.Builder().url(wsUrl).build()
+        val request = Request.Builder()
+            .url(wsUrl)
+            .header("x-goog-api-key", apiKey)
+            .build()
         val ws = httpClient.newWebSocket(
             request,
             object : WebSocketListener() {

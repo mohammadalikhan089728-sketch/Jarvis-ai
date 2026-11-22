@@ -464,8 +464,8 @@ fun SettingsScreen(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 VoiceOptionRow(
-                    title = "With AI Voice (Single Persistent Live Session)",
-                    subtitle = "ONE live audio link (Charon / Orus deep male Hindi/Hinglish voice) • Zero per-turn REST loop • Auto-cooldown & offline fallback",
+                    title = "With AI Voice (Real-Time Native Audio Stream)",
+                    subtitle = "Default • Persistent Live WebSocket (Puck / Charon / Orus • 16kHz in / 24kHz out • AEC + Lazy Screen Read + 3-min Auto-Sleep)",
                     badgeText = "LIVE AUDIO",
                     badgeColor = ArcCyan,
                     selected = voiceMode == VOICE_MODE_AI_VOICE,
@@ -479,15 +479,30 @@ fun SettingsScreen(
                 if (voiceMode == VOICE_MODE_AI_VOICE) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "SELECT AI MALE VOICE PROFILE",
+                        text = "SELECT REAL-TIME AI VOICE PROFILE",
                         style = MaterialTheme.typography.labelMedium,
                         color = ArcCyan
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
+                        FilterChip(
+                            selected = aiVoiceName == AI_VOICE_PUCK || aiVoiceName.isBlank(),
+                            onClick = {
+                                aiVoiceName = AI_VOICE_PUCK
+                                onSaveSettings(buildCurrentEntity())
+                            },
+                            label = { Text("Puck") },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = ArcCyan.copy(alpha = 0.22f),
+                                selectedLabelColor = ArcCyan
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("ai_voice_puck_chip")
+                        )
                         FilterChip(
                             selected = aiVoiceName == AI_VOICE_CHARON,
                             onClick = {
