@@ -62,6 +62,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     private val appContext = application.applicationContext
     private val database = JarvisDatabase.getInstance(appContext)
     private val repository = JarvisRepository(database)
+    private val memoryManager = MemoryManager(repository)
     private val aiClient = GeminiApiClient()
     private val previewVoiceEngine = VoiceEngineManager(appContext, aiClient)
 
@@ -98,6 +99,9 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     val pendingAlerts: StateFlow<List<PendingCallAlertEntity>> = repository.pendingAlertsFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val userMemories: StateFlow<List<UserMemoryEntity>> = repository.memoriesFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     val screenSummary: StateFlow<String> = JarvisAccessibilityService.lastScreenSummary
@@ -355,7 +359,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     fun verifyAiCoreApiKey(apiKey: String) {
         viewModelScope.launch {
             _keyVerificationState.value = KeyVerificationUiState.Verifying
-            when (val res = aiClient.verifyApiKey(apiKey)) {
+            when (val res = aiClient.verifyApiKey(apiKey, settings.value.coreEngine)) {
                 is KeyVerificationResult.Valid -> {
                     _keyVerificationState.value = KeyVerificationUiState.Verified(res.latencyMs)
                 }
@@ -363,6 +367,26 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
                     _keyVerificationState.value = KeyVerificationUiState.Failed(res.message)
                 }
             }
+        }
+    }
+
+    fun addUserMemory(factText: String, category: String) {
+        if (factText.isBlank()) return
+        viewModelScope.launch {
+            val saved = memoryManager.saveMemory(
+                factText = factText.trim(),
+                category = category.ifBlank { memoryManager.inferCategory(factText) }
+            )
+            if (saved) {
+                _localStatusBanner.value = "Saved to JARVIS Memory Vault"
+            }
+        }
+    }
+
+    fun deleteUserMemory(memory: UserMemoryEntity) {
+        viewModelScope.launch {
+            repository.deleteMemory(memory)
+            _localStatusBanner.value = "Memory removed from local vault"
         }
     }
 

@@ -19,6 +19,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddAlert
 import androidx.compose.material.icons.filled.Assistant
 import androidx.compose.material.icons.filled.Call
@@ -28,10 +29,12 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PhoneInTalk
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Visibility
@@ -110,6 +113,7 @@ fun SettingsScreen(
     notificationListenerGranted: Boolean,
     wakeWordServiceRunning: Boolean,
     scheduledCalls: List<ScheduledCallEntity>,
+    userMemories: List<UserMemoryEntity>,
     onSaveSettings: (SettingsEntity) -> Unit,
     onVerifyApiKey: (String) -> Unit,
     onResetVerification: () -> Unit,
@@ -121,6 +125,8 @@ fun SettingsScreen(
     onAddScheduledCall: (hour: Int, minute: Int, purpose: String, actionType: String, repeatDaysCsv: String) -> Unit,
     onToggleScheduledCall: (ScheduledCallEntity, Boolean) -> Unit,
     onDeleteScheduledCall: (ScheduledCallEntity) -> Unit,
+    onAddUserMemory: (factText: String, category: String) -> Unit,
+    onDeleteUserMemory: (UserMemoryEntity) -> Unit,
     onTestIncomingCall: () -> Unit,
     onTestScreenTap: () -> Unit,
     modifier: Modifier = Modifier
@@ -130,9 +136,15 @@ fun SettingsScreen(
     } else {
         VOICE_MODE_NORMAL
     }
+    val normalizedInitialEngine = if (settings.coreEngine == ENGINE_V35_DEEP) {
+        ENGINE_V35_DEEP
+    } else {
+        ENGINE_V25_LITE
+    }
 
     var apiKey by rememberSaveable { mutableStateOf(settings.geminiApiKey) }
     var showApiKey by rememberSaveable { mutableStateOf(false) }
+    var coreEngine by rememberSaveable { mutableStateOf(normalizedInitialEngine) }
     var masterPrompt by rememberSaveable { mutableStateOf(settings.masterSystemPrompt) }
     var voiceMode by rememberSaveable { mutableStateOf(normalizedInitialMode) }
     var aiVoiceName by rememberSaveable { mutableStateOf(settings.aiVoiceName.ifBlank { AI_VOICE_CHARON }) }
@@ -149,10 +161,12 @@ fun SettingsScreen(
     var autoReplyTargetContact by rememberSaveable { mutableStateOf(settings.autoReplyTargetContact) }
     var savedBanner by remember { mutableStateOf<String?>(null) }
     var showScheduleDialog by remember { mutableStateOf(false) }
+    var showAddMemoryDialog by remember { mutableStateOf(false) }
 
     // Synchronize local form fields when Room emits saved updates
     LaunchedEffect(settings.updatedAt) {
         apiKey = settings.geminiApiKey
+        coreEngine = if (settings.coreEngine == ENGINE_V35_DEEP) ENGINE_V35_DEEP else ENGINE_V25_LITE
         masterPrompt = settings.masterSystemPrompt
         voiceMode = if (settings.voiceMode == VOICE_MODE_AI_VOICE) VOICE_MODE_AI_VOICE else VOICE_MODE_NORMAL
         aiVoiceName = settings.aiVoiceName.ifBlank { AI_VOICE_CHARON }
@@ -187,7 +201,8 @@ fun SettingsScreen(
             customWakeWord = customWakeWord.trim().ifBlank { "Jarvis" },
             alwaysOnWakeWordEnabled = alwaysOnWakeWord,
             aiVoiceName = aiVoiceName.ifBlank { AI_VOICE_CHARON },
-            onlineAutoCallEnabled = onlineAutoCallEnabled
+            onlineAutoCallEnabled = onlineAutoCallEnabled,
+            coreEngine = coreEngine
         )
     }
 
@@ -199,6 +214,17 @@ fun SettingsScreen(
                 onAddScheduledCall(hour, minute, purpose, actionType, repeatCsv)
                 showScheduleDialog = false
                 savedBanner = "Scheduled JARVIS call for ${CallAlarmScheduler.formatTime12Hour(hour, minute)}."
+            }
+        )
+    }
+
+    if (showAddMemoryDialog) {
+        AddMemoryDialog(
+            onDismiss = { showAddMemoryDialog = false },
+            onConfirm = { fact, category ->
+                onAddUserMemory(fact, category)
+                showAddMemoryDialog = false
+                savedBanner = "Memory stored permanently in local Room Vault."
             }
         )
     }
@@ -398,8 +424,8 @@ fun SettingsScreen(
                 icon = Icons.Filled.GraphicEq
             ) {
                 VoiceOptionRow(
-                    title = "Normal Voice",
-                    subtitle = "Fast sentence-by-sentence streaming + Android Neural Speech ($activeVoiceLabel) • Saves API quota",
+                    title = "Normal Voice (Zero-Audio-Token Neural TTS)",
+                    subtitle = "Default • Fast streaming + Neural Male Speech ($activeVoiceLabel, 0 audio tokens) • 10x daily quota saver",
                     selected = voiceMode == VOICE_MODE_NORMAL,
                     onSelect = {
                         voiceMode = VOICE_MODE_NORMAL
@@ -410,7 +436,9 @@ fun SettingsScreen(
                 Spacer(modifier = Modifier.height(8.dp))
                 VoiceOptionRow(
                     title = "With AI Voice",
-                    subtitle = "Ultra-realistic native AI male voice • Automatically falls back to Normal Voice when offline",
+                    subtitle = "Ultra-realistic live neural male voice • Auto-falls back to Normal Voice when offline",
+                    badgeText = "HIGH TOKEN USAGE",
+                    badgeColor = StarkAmber,
                     selected = voiceMode == VOICE_MODE_AI_VOICE,
                     onSelect = {
                         voiceMode = VOICE_MODE_AI_VOICE
@@ -635,6 +663,99 @@ fun SettingsScreen(
                 }
             }
 
+            // 4B. JARVIS Core Engine Selector (2 Selectable Engines + Silent Automatic Failover)
+            SettingsSectionCard(
+                title = "JARVIS CORE ENGINE",
+                icon = Icons.Filled.Memory
+            ) {
+                Text(
+                    text = "Select your active JARVIS intelligence core. Silent automatic failover switches instantly if one tier hits a rate limit or network hiccup.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                VoiceOptionRow(
+                    title = "Core Engine v2.5 (Ultra-Fast & Max Daily Limit — Default)",
+                    subtitle = "Optimized for 1,000+ daily requests, zero-thinking latency, and instant voice replies",
+                    badgeText = "10X QUOTA",
+                    badgeColor = SignalGreen,
+                    selected = coreEngine == ENGINE_V25_LITE,
+                    onSelect = {
+                        coreEngine = ENGINE_V25_LITE
+                        onSaveSettings(buildCurrentEntity())
+                        savedBanner = "Active engine switched to JARVIS Core Engine v2.5."
+                    },
+                    tag = "core_engine_v25_radio"
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                VoiceOptionRow(
+                    title = "Core Engine v3.5 (Deep Reasoning Backup)",
+                    subtitle = "High-precision reasoning tier with automatic fallback to v2.5 if rate-limited",
+                    badgeText = "DEEP BACKUP",
+                    badgeColor = ArcCyan,
+                    selected = coreEngine == ENGINE_V35_DEEP,
+                    onSelect = {
+                        coreEngine = ENGINE_V35_DEEP
+                        onSaveSettings(buildCurrentEntity())
+                        savedBanner = "Active engine switched to JARVIS Core Engine v3.5."
+                    },
+                    tag = "core_engine_v35_radio"
+                )
+            }
+
+            // 4C. JARVIS Long-Term Memory Vault (100% Local Room DB)
+            SettingsSectionCard(
+                title = "JARVIS MEMORY VAULT (${userMemories.size})",
+                icon = Icons.Filled.Storage
+            ) {
+                Text(
+                    text = "JARVIS remembers your personal facts, routines, and goals 100% locally. Say \"Yaad rakhna...\" or \"Remember...\" anytime — only the top 6 relevant facts are injected to keep token usage ultra-low.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = { showAddMemoryDialog = true },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ArcCyan,
+                        contentColor = ObsidianVoid
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("add_memory_vault_button")
+                ) {
+                    Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("ADD MEMORY FACT")
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+
+                if (userMemories.isEmpty()) {
+                    Surface(
+                        shape = MaterialTheme.shapes.medium,
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "No long-term memories stored yet. Say \"Yaad rakhna mera naam...\" or tap ADD MEMORY FACT above.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        userMemories.take(25).forEach { memory ->
+                            MemoryVaultRowCard(
+                                memory = memory,
+                                onDelete = { onDeleteUserMemory(memory) }
+                            )
+                        }
+                    }
+                }
+            }
+
             // 5. JARVIS Neural Core Key Section (Strictly zero third-party model branding)
             SettingsSectionCard(
                 title = "JARVIS NEURAL CORE",
@@ -646,7 +767,11 @@ fun SettingsScreen(
                     border = BorderStroke(1.dp, ArcCyan.copy(alpha = 0.45f))
                 ) {
                     Text(
-                        text = "ENGINE: JARVIS NEURAL CORE",
+                        text = if (coreEngine == ENGINE_V35_DEEP) {
+                            "ACTIVE CORE: JARVIS ENGINE v3.5"
+                        } else {
+                            "ACTIVE CORE: JARVIS ENGINE v2.5"
+                        },
                         style = MaterialTheme.typography.labelMedium,
                         color = ArcCyan,
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
@@ -1198,12 +1323,155 @@ private fun SettingsSectionCard(
 }
 
 @Composable
+private fun MemoryVaultRowCard(
+    memory: UserMemoryEntity,
+    onDelete: () -> Unit
+) {
+    val badgeColor = when (memory.category) {
+        MEMORY_CAT_PROFILE -> ArcCyan
+        MEMORY_CAT_ROUTINE -> SignalGreen
+        MEMORY_CAT_GOAL -> StarkAmber
+        MEMORY_CAT_PREFERENCE -> Color(0xFFA78BFA)
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.45f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("memory_vault_card_${memory.id}")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = badgeColor.copy(alpha = 0.14f),
+                    border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.45f))
+                ) {
+                    Text(
+                        text = memory.category,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = badgeColor,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = memory.factText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+            IconButton(
+                onClick = onDelete,
+                modifier = Modifier.testTag("delete_memory_${memory.id}")
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Delete,
+                    contentDescription = "Delete memory",
+                    tint = SignalCrimson
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AddMemoryDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (factText: String, category: String) -> Unit
+) {
+    var factText by remember { mutableStateOf("") }
+    var category by remember { mutableStateOf(MEMORY_CAT_PROFILE) }
+    val categories = listOf(
+        MEMORY_CAT_PROFILE,
+        MEMORY_CAT_ROUTINE,
+        MEMORY_CAT_GOAL,
+        MEMORY_CAT_PREFERENCE,
+        MEMORY_CAT_GENERAL
+    )
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        title = {
+            Text(
+                text = "Add to JARVIS Memory Vault",
+                style = MaterialTheme.typography.titleMedium,
+                color = ArcCyan
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = factText,
+                    onValueChange = { factText = it },
+                    label = { Text("Personal Fact / Routine / Preference") },
+                    placeholder = { Text("e.g. Subah 6 baje Maths padhna hai") },
+                    minLines = 2,
+                    maxLines = 4,
+                    colors = hudTextFieldColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("add_memory_fact_input")
+                )
+                Text(
+                    text = "Category",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    categories.forEach { cat ->
+                        FilterChip(
+                            selected = category == cat,
+                            onClick = { category = cat },
+                            label = { Text(cat) }
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (factText.trim().length >= 4) {
+                        onConfirm(factText.trim(), category)
+                    }
+                },
+                enabled = factText.trim().length >= 4,
+                modifier = Modifier.testTag("confirm_add_memory_button")
+            ) {
+                Text("SAVE MEMORY")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("CANCEL")
+            }
+        }
+    )
+}
+
+@Composable
 private fun VoiceOptionRow(
     title: String,
     subtitle: String,
     selected: Boolean,
     onSelect: () -> Unit,
-    tag: String
+    tag: String,
+    badgeText: String? = null,
+    badgeColor: Color = StarkAmber
 ) {
     Surface(
         onClick = onSelect,
@@ -1233,6 +1501,22 @@ private fun VoiceOptionRow(
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface
                 )
+                if (!badgeText.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = badgeColor.copy(alpha = 0.16f),
+                        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.55f))
+                    ) {
+                        Text(
+                            text = badgeText,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = badgeColor,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(3.dp))
                 Text(
                     text = subtitle,
                     style = MaterialTheme.typography.bodySmall,

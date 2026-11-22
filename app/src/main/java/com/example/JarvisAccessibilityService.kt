@@ -44,32 +44,48 @@ data class ScreenHierarchySnapshot(
     val capturedAt: Long = System.currentTimeMillis()
 ) {
     /**
-     * Compact JSON schema containing id, text, desc, x, y, clickable, editable, scrollable
-     * for ultra-reliable real-time touch control and multi-step phone automation.
+     * Ultra-compact JSON schema (~80% token reduction):
+     * Keeps ONLY the top 25 visible interactive/readable elements with ONLY id, text, x, y.
      */
-    fun toCompactJson(): String {
+    fun toCompactJson(maxElements: Int = MAX_COMPACT_NODES): String {
         val root = JSONObject()
-        root.put("package", packageName)
-        root.put("width", screenWidth)
-        root.put("height", screenHeight)
-        val arr = JSONArray()
-        for (node in nodes) {
-            val obj = JSONObject()
-            if (node.viewId.isNotBlank()) obj.put("id", node.viewId)
-            if (node.text.isNotBlank()) obj.put("text", node.text)
-            if (node.contentDescription.isNotBlank() && node.contentDescription != node.text) {
-                obj.put("desc", node.contentDescription)
+        root.put("pkg", packageName)
+        root.put("w", screenWidth)
+        root.put("h", screenHeight)
+
+        val prioritized = nodes
+            .filter { node ->
+                val label = node.text.ifBlank { node.contentDescription }.trim()
+                label.isNotEmpty() || node.viewId.isNotBlank() || node.clickable || node.editable
             }
+            .sortedByDescending { node ->
+                var score = 0
+                if (node.editable) score += 50
+                if (node.clickable) score += 35
+                if (node.text.isNotBlank()) score += 25
+                if (node.contentDescription.isNotBlank()) score += 15
+                if (node.viewId.isNotBlank()) score += 10
+                if (node.scrollable) score += 5
+                score
+            }
+            .take(maxElements)
+
+        val arr = JSONArray()
+        for (node in prioritized) {
+            val label = node.text.ifBlank { node.contentDescription }.trim().take(64)
+            val obj = JSONObject()
+            if (node.viewId.isNotBlank()) obj.put("id", node.viewId.take(36))
+            if (label.isNotEmpty()) obj.put("text", label)
             obj.put("x", node.centerX)
             obj.put("y", node.centerY)
-            if (node.clickable) obj.put("clickable", true)
-            if (node.editable) obj.put("editable", true)
-            if (node.scrollable) obj.put("scrollable", true)
-            if (node.checked) obj.put("checked", true)
             arr.put(obj)
         }
-        root.put("nodes", arr)
+        root.put("el", arr)
         return root.toString()
+    }
+
+    companion object {
+        const val MAX_COMPACT_NODES = 25
     }
 
     fun toPlainReadableText(): String {

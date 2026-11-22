@@ -134,7 +134,8 @@ class JarvisNotificationListenerService : NotificationListenerService() {
                 senderName = rawTitle,
                 appLabel = appLabel,
                 incomingMessage = rawMessage,
-                recentConversation = recentConvo
+                recentConversation = recentConvo,
+                selectedEngine = settings.coreEngine
             )
 
             val replyText = replyResult.getOrNull()?.trim().orEmpty()

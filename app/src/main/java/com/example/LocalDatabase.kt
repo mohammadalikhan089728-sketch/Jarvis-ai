@@ -21,6 +21,10 @@ const val VOICE_MODE_AI_VOICE = "AI_VOICE"
 const val VOICE_MODE_DEFAULT = VOICE_MODE_NORMAL
 const val VOICE_MODE_CUSTOM_URL = "CUSTOM_URL"
 
+// Selectable Core Engines (Never expose third-party model names in UI)
+const val ENGINE_V25_LITE = "CORE_V25"
+const val ENGINE_V35_DEEP = "CORE_V35"
+
 // Selectable Male AI Voices
 const val AI_VOICE_CHARON = "Charon"
 const val AI_VOICE_FENRIR = "Fenrir"
@@ -39,6 +43,13 @@ const val CALL_TYPE_ONLINE_ALERT = "ONLINE_EVENT_ALERT"
 const val ALERT_CATEGORY_VIRAL = "VIRAL_MILESTONE"
 const val ALERT_CATEGORY_SURGE = "ENGAGEMENT_SURGE"
 const val ALERT_CATEGORY_URGENT = "URGENT_MESSAGE"
+
+// Memory Vault Categories
+const val MEMORY_CAT_PROFILE = "PROFILE"
+const val MEMORY_CAT_ROUTINE = "ROUTINE"
+const val MEMORY_CAT_PREFERENCE = "PREFERENCE"
+const val MEMORY_CAT_GOAL = "GOAL"
+const val MEMORY_CAT_GENERAL = "GENERAL"
 
 val DEFAULT_MASTER_PROMPT = """
 You are J.A.R.V.I.S. (Developed by Mozahid), an ultra-capable, composed, intelligent personal AI systems agent.
@@ -74,8 +85,11 @@ data class SettingsEntity(
     val alwaysOnWakeWordEnabled: Boolean = false,
     val aiVoiceName: String = AI_VOICE_CHARON,
     val onlineAutoCallEnabled: Boolean = true,
+    val coreEngine: String = ENGINE_V25_LITE,
     val updatedAt: Long = System.currentTimeMillis()
 )
+
+typealias AppSettingsEntity = SettingsEntity
 
 @Entity(tableName = "chat_history")
 data class ChatHistoryEntity(
@@ -131,6 +145,14 @@ data class PendingCallAlertEntity(
     val alertCategory: String = ALERT_CATEGORY_VIRAL,
     val handled: Boolean = false,
     val createdAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "user_memories")
+data class UserMemoryEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val factText: String,
+    val category: String = MEMORY_CAT_GENERAL,
+    val timestamp: Long = System.currentTimeMillis()
 )
 
 @Dao
@@ -239,6 +261,24 @@ interface PendingCallAlertDao {
     suspend fun clearAll()
 }
 
+@Dao
+interface UserMemoryDao {
+    @Query("SELECT * FROM user_memories ORDER BY timestamp DESC")
+    fun observeMemories(): Flow<List<UserMemoryEntity>>
+
+    @Query("SELECT * FROM user_memories ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun getRecentMemoriesOnce(limit: Int = 60): List<UserMemoryEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertMemory(memory: UserMemoryEntity): Long
+
+    @Delete
+    suspend fun deleteMemory(memory: UserMemoryEntity)
+
+    @Query("DELETE FROM user_memories")
+    suspend fun clearAll()
+}
+
 @Database(
     entities = [
         SettingsEntity::class,
@@ -246,9 +286,10 @@ interface PendingCallAlertDao {
         CustomMacroEntity::class,
         AutoChatLogsEntity::class,
         ScheduledCallEntity::class,
-        PendingCallAlertEntity::class
+        PendingCallAlertEntity::class,
+        UserMemoryEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class JarvisDatabase : RoomDatabase() {
@@ -258,6 +299,7 @@ abstract class JarvisDatabase : RoomDatabase() {
     abstract fun autoChatDao(): AutoChatDao
     abstract fun scheduledCallDao(): ScheduledCallDao
     abstract fun pendingCallAlertDao(): PendingCallAlertDao
+    abstract fun userMemoryDao(): UserMemoryDao
 
     companion object {
         @Volatile
@@ -331,6 +373,24 @@ abstract class JarvisDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE jarvis_settings ADD COLUMN coreEngine TEXT NOT NULL DEFAULT 'CORE_V25'"
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS user_memories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        factText TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): JarvisDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -338,7 +398,7 @@ abstract class JarvisDatabase : RoomDatabase() {
                     JarvisDatabase::class.java,
                     "jarvis_local_core.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                     .also { INSTANCE = it }
@@ -354,6 +414,7 @@ class JarvisRepository(private val database: JarvisDatabase) {
     private val autoChatDao = database.autoChatDao()
     private val scheduledCallDao = database.scheduledCallDao()
     private val pendingCallAlertDao = database.pendingCallAlertDao()
+    private val userMemoryDao = database.userMemoryDao()
 
     val settingsFlow: Flow<SettingsEntity?> = settingsDao.observeSettings()
     val historyFlow: Flow<List<ChatHistoryEntity>> = chatHistoryDao.observeHistory()
@@ -361,6 +422,7 @@ class JarvisRepository(private val database: JarvisDatabase) {
     val autoChatLogsFlow: Flow<List<AutoChatLogsEntity>> = autoChatDao.observeRecentLogs()
     val scheduledCallsFlow: Flow<List<ScheduledCallEntity>> = scheduledCallDao.observeScheduledCalls()
     val pendingAlertsFlow: Flow<List<PendingCallAlertEntity>> = pendingCallAlertDao.observeAlerts()
+    val memoriesFlow: Flow<List<UserMemoryEntity>> = userMemoryDao.observeMemories()
 
     suspend fun ensureDefaultsInitialized(): SettingsEntity {
         val existing = settingsDao.getSettingsOnce()
@@ -463,5 +525,21 @@ class JarvisRepository(private val database: JarvisDatabase) {
 
     suspend fun markAllAlertsHandled() {
         pendingCallAlertDao.markAllHandled()
+    }
+
+    suspend fun saveMemory(memory: UserMemoryEntity): Long {
+        return userMemoryDao.insertMemory(memory)
+    }
+
+    suspend fun getRecentMemories(limit: Int = 60): List<UserMemoryEntity> {
+        return userMemoryDao.getRecentMemoriesOnce(limit)
+    }
+
+    suspend fun deleteMemory(memory: UserMemoryEntity) {
+        userMemoryDao.deleteMemory(memory)
+    }
+
+    suspend fun clearMemories() {
+        userMemoryDao.clearAll()
     }
 }

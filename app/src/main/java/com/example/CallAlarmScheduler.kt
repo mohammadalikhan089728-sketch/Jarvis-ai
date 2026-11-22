@@ -12,6 +12,7 @@ import java.util.Locale
 /**
  * Schedules unlimited JARVIS incoming calls using AlarmManager.setAlarmClock(...)
  * so alarms reliably wake the phone out of Doze mode and ring over the lock screen.
+ * Supports both recurring clock schedules and exact relative delays (e.g., "10 minute baad call karna").
  */
 object CallAlarmScheduler {
 
@@ -47,14 +48,56 @@ object CallAlarmScheduler {
         return candidate.timeInMillis
     }
 
+    /**
+     * Immediately saves a one-time ScheduledCallEntity at `System.currentTimeMillis() + delayMillis`
+     * and schedules an exact AlarmManager.setAlarmClock(...) trigger.
+     * Used by in-call & normal voice commands like "10 minute baad call karna" or "1 ghante baad call karna".
+     */
+    suspend fun scheduleRelativeCall(
+        context: Context,
+        repository: JarvisRepository,
+        delayMillis: Long,
+        purpose: String,
+        actionType: String = CALL_TYPE_CUSTOM_REMINDER
+    ): ScheduledCallEntity = withContext(Dispatchers.IO) {
+        val safeDelay = delayMillis.coerceIn(30_000L, 48L * 60L * 60L * 1000L)
+        val triggerAtMillis = System.currentTimeMillis() + safeDelay
+        val cal = Calendar.getInstance().apply { timeInMillis = triggerAtMillis }
+
+        val entity = ScheduledCallEntity(
+            hour = cal.get(Calendar.HOUR_OF_DAY),
+            minute = cal.get(Calendar.MINUTE),
+            purpose = purpose.trim().ifBlank { "JARVIS Follow-Up Call" },
+            actionType = actionType,
+            repeatDaysCsv = "ONCE",
+            enabled = true
+        )
+        val savedId = repository.saveScheduledCall(entity)
+        val saved = entity.copy(id = savedId)
+        scheduleCallAtExactMillis(context.applicationContext, saved, triggerAtMillis)
+        saved
+    }
+
     fun scheduleCall(context: Context, call: ScheduledCallEntity): Long? {
+        if (!call.enabled || call.id <= 0L) {
+            cancelCall(context, call.id)
+            return null
+        }
+        val triggerAtMillis = computeNextTriggerMillis(call)
+        return scheduleCallAtExactMillis(context, call, triggerAtMillis)
+    }
+
+    fun scheduleCallAtExactMillis(
+        context: Context,
+        call: ScheduledCallEntity,
+        triggerAtMillis: Long
+    ): Long? {
         if (!call.enabled || call.id <= 0L) {
             cancelCall(context, call.id)
             return null
         }
 
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val triggerAtMillis = computeNextTriggerMillis(call)
 
         val broadcastIntent = Intent(context, CallAlarmReceiver::class.java).apply {
             action = CallAlarmReceiver.ACTION_SCHEDULED_CALL_RING
@@ -86,7 +129,6 @@ object CallAlarmScheduler {
             alarmManager.setAlarmClock(alarmClockInfo, operationPi)
             triggerAtMillis
         }.getOrElse {
-            // Safe fallback if exact alarm permission was revoked
             runCatching {
                 alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, operationPi)
                 triggerAtMillis

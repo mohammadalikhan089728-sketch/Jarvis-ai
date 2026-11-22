@@ -103,6 +103,8 @@ class JarvisIncomingCallActivity : ComponentActivity() {
     private lateinit var offlineProcessor: OfflineCommandProcessor
     private lateinit var agentEngine: JarvisAgentEngine
     private lateinit var voiceEngine: VoiceEngineManager
+    private lateinit var memoryManager: MemoryManager
+    private lateinit var localRouter: LocalCommandRouter
 
     private var ringtone: Ringtone? = null
     private var vibrator: Vibrator? = null
@@ -143,6 +145,8 @@ class JarvisIncomingCallActivity : ComponentActivity() {
         offlineProcessor = OfflineCommandProcessor(applicationContext)
         agentEngine = JarvisAgentEngine(applicationContext, repository, aiClient, offlineProcessor)
         voiceEngine = VoiceEngineManager(applicationContext, aiClient)
+        memoryManager = MemoryManager(repository)
+        localRouter = LocalCommandRouter(applicationContext, repository, offlineProcessor, memoryManager)
 
         extractCallExtras(intent)
         startRingingAndVibrating()
@@ -355,12 +359,15 @@ class JarvisIncomingCallActivity : ComponentActivity() {
         var streamingStarted = false
         val collectedReply = StringBuilder()
 
+        val memoryContext = memoryManager.buildCompactMemoryContext(promptText)
         val result = aiClient.streamConversationalReply(
             rawApiKey = settings.geminiApiKey,
             masterSystemPrompt = settings.masterSystemPrompt,
             userPrompt = promptText,
             recentHistory = callDialogueLog.takeLast(6),
             extraSystemGuidance = callGuidance,
+            selectedEngine = settings.coreEngine,
+            memoryContext = memoryContext,
             onSentenceReady = { sentence ->
                 val cleanSentence = JarvisResponseSanitizer.sanitizePlainSpeechText(sentence)
                 if (cleanSentence.isEmpty()) return@streamConversationalReply
@@ -415,29 +422,56 @@ class JarvisIncomingCallActivity : ComponentActivity() {
         _userTranscript.value = spoken
         lastSpeechElapsedMs = SystemClock.elapsedRealtime()
 
-        // Allow hands-free hang up by voice
-        if (lower.contains("end call") || lower.contains("hang up") || lower.contains("call kaat") || lower.contains("bye jarvis")) {
-            turnJob?.cancel()
-            turnJob = lifecycleScope.launch {
-                val settings = repository.getSettings()
-                val bye = "Alright Sir, ending the call. Have a productive session!"
-                _jarvisSpeechText.value = bye
-                voiceEngine.speak(bye, settings) {
-                    declineOrEndCall()
-                }
-            }
-            return
-        }
+        turnJob?.cancel()
+        turnJob = lifecycleScope.launch {
+            val settings = repository.getSettings()
 
-        // Smart Views Check Call: polite permission-based ONE-TIME screen check only when user says YES
-        if (callActionType == CALL_TYPE_SMART_VIEWS_CHECK &&
-            !viewsScreenCheckDone &&
-            isAffirmativeViewsCheck(lower)
-        ) {
-            viewsScreenCheckDone = true
-            turnJob?.cancel()
-            turnJob = lifecycleScope.launch {
-                val settings = repository.getSettings()
+            // 1. Zero-Token In-Call Local Router:
+            //    - Combined hangup + relative call scheduling ("Theek hai abhi cut kar do, 10 minute baad call karna")
+            //    - Standalone relative call scheduling ("1 ghante baad call karna")
+            //    - Instant call hangup ("Call cut kar do", "Phone rakh do", "End call")
+            //    - Explicit long-term memory save ("Yaad rakhna...")
+            when (
+                val route = localRouter.tryRoute(
+                    rawQuery = spoken,
+                    inActiveCall = true,
+                    defaultCallPurpose = callPurpose,
+                    defaultCallActionType = callActionType
+                )
+            ) {
+                LocalRouteResult.IgnoredNoise -> {
+                    scheduleCallListeningRestart(MicCoordinator.ERROR_RESTART_DEBOUNCE_MS)
+                    return@launch
+                }
+                is LocalRouteResult.Handled -> {
+                    val cleanReply = JarvisResponseSanitizer.extractCleanReply(route.reply)
+                    _jarvisSpeechText.value = cleanReply
+                    _statusLine.value = if (route.shouldEndCall) {
+                        "CONFIRMING & DISCONNECTING…"
+                    } else {
+                        "JARVIS SPEAKING…"
+                    }
+                    voiceEngine.speak(cleanReply, settings) {
+                        if (route.shouldEndCall) {
+                            declineOrEndCall()
+                        } else {
+                            scheduleCallListeningRestart(MicCoordinator.POST_SPEECH_RESTART_DELAY_MS)
+                        }
+                    }
+                    return@launch
+                }
+                LocalRouteResult.NotHandled -> Unit
+            }
+
+            // Passively store personal routines/goals shared during the call
+            memoryManager.detectAndSaveImplicitMemory(spoken)
+
+            // 2. Smart Views Check Call: polite permission-based ONE-TIME screen check only when user says YES
+            if (callActionType == CALL_TYPE_SMART_VIEWS_CHECK &&
+                !viewsScreenCheckDone &&
+                isAffirmativeViewsCheck(lower)
+            ) {
+                viewsScreenCheckDone = true
                 val targetApp = if (lower.contains("youtube")) "YouTube" else "Instagram"
                 _statusLine.value = "OPENING $targetApp FOR ONE-TIME CHECK…"
                 _jarvisSpeechText.value = "Checking $targetApp once now, Sir."
@@ -452,13 +486,9 @@ class JarvisIncomingCallActivity : ComponentActivity() {
 
                 val summaryPrompt = "The user said yes to checking $targetApp views once. Summarize any visible view/like/subscriber numbers from this screen text clearly in 2 short spoken sentences:\n$screenText"
                 speakCallTurn(summaryPrompt, settings)
+                return@launch
             }
-            return
-        }
 
-        turnJob?.cancel()
-        turnJob = lifecycleScope.launch {
-            val settings = repository.getSettings()
             speakCallTurn(spoken, settings)
         }
     }
@@ -566,7 +596,7 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                 ?.firstOrNull()
                 ?.trim()
                 .orEmpty()
-            if (spoken.isBlank()) {
+            if (spoken.isBlank() || localRouter.isShortOrNoise(spoken)) {
                 scheduleCallListeningRestart(MicCoordinator.ERROR_RESTART_DEBOUNCE_MS)
             } else {
                 handleUserCallUtterance(spoken)
@@ -627,7 +657,7 @@ class JarvisIncomingCallActivity : ComponentActivity() {
         _isCallActive.value = false
         MicCoordinator.setIncomingCallActive(false)
         MicCoordinator.release(MicOwner.INCOMING_CALL)
-        finish()
+        runCatching { finishAndRemoveTask() }.onFailure { finish() }
     }
 
     private fun stopRecognizerCleanly() {

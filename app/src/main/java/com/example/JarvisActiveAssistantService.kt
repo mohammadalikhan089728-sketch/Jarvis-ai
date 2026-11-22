@@ -455,7 +455,8 @@ class JarvisActiveAssistantService : Service() {
                 ?.trim()
                 .orEmpty()
 
-            if (spoken.isEmpty()) {
+            val strippedAlphaNum = spoken.replace(Regex("[^a-zA-Z0-9\\u0900-\\u097F]"), "")
+            if (spoken.isEmpty() || strippedAlphaNum.length < LocalCommandRouter.MIN_VALID_SPEECH_CHARS) {
                 if (_isSessionActive.value) {
                     scheduleLiveRestart(MicCoordinator.ERROR_RESTART_DEBOUNCE_MS)
                 }
@@ -534,6 +535,11 @@ class JarvisActiveAssistantService : Service() {
                     voiceEngine.finishStreamingSpeech()
                 }
             )
+
+            if (result.executedAction == "LOCAL:NOISE_IGNORED") {
+                handlePostSpeechTurnTaking()
+                return@launch
+            }
 
             val cleanReply = JarvisResponseSanitizer.extractCleanReply(result.reply)
             _statusBanner.value = "${result.executedAction} • ${result.latencyMs}ms"

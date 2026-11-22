@@ -23,7 +23,8 @@ import java.util.concurrent.atomic.AtomicInteger
 data class JarvisAiAction(
     val action: String,
     val params: JSONObject,
-    val reply: String
+    val reply: String,
+    val saveMemory: String? = null
 )
 
 data class AiAudioPayload(
@@ -35,6 +36,12 @@ sealed interface KeyVerificationResult {
     data class Valid(val latencyMs: Long) : KeyVerificationResult
     data class Invalid(val message: String) : KeyVerificationResult
 }
+
+private data class EngineModelSpec(
+    val modelId: String,
+    val maxOutputTokens: Int,
+    val thinkingBudget: Int = 0
+)
 
 /**
  * Strict text sanitizer guaranteeing JARVIS NEVER displays or speaks raw markdown fences,
@@ -51,10 +58,6 @@ object JarvisResponseSanitizer {
     private val BRAND_LEAK_REGEX = Regex("(?i)gemini[\\w.-]*")
     private val MULTI_SPACE_REGEX = Regex("\\s+")
 
-    /**
-     * Parses raw AI output that might be wrapped in markdown fences or JSON (`json { "reply": "..." }`),
-     * extracts ONLY the human-readable `"reply"` value, and removes all stray brackets/symbols.
-     */
     fun extractCleanReply(raw: String): String {
         val trimmed = raw.trim()
         if (trimmed.isEmpty()) return ""
@@ -64,9 +67,6 @@ object JarvisResponseSanitizer {
         return sanitizePlainSpeechText(extracted)
     }
 
-    /**
-     * Final safety pass before UI rendering or TTS/AI Voice playback.
-     */
     fun sanitizePlainSpeechText(raw: String): String {
         if (raw.isBlank()) return ""
         var text = stripMarkdownFences(raw)
@@ -90,7 +90,7 @@ object JarvisResponseSanitizer {
         val t = text.trimStart()
         return t.startsWith("{") ||
             t.startsWith("```") ||
-            t.startsWith("json", ignoreCase = true) && (t.contains("{") || t.contains("reply"))
+            (t.startsWith("json", ignoreCase = true) && (t.contains("{") || t.contains("reply")))
     }
 
     fun stripMarkdownFences(raw: String): String {
@@ -117,7 +117,6 @@ object JarvisResponseSanitizer {
             }
         }
 
-        // Fallback regex extraction if JSON was truncated or malformed
         val replyMatch = REPLY_FIELD_REGEX.find(candidate)
             ?: TEXT_FIELD_REGEX.find(candidate)
         if (replyMatch != null) {
@@ -137,17 +136,24 @@ object JarvisResponseSanitizer {
     }
 }
 
+/**
+ * JARVIS Neural Core Network Client (Developed by Mozahid).
+ * - Supports 2 selectable engines with silent automatic fallback on HTTP 404/429/503:
+ *     1. Core Engine v2.5 (Default): gemini-2.5-flash-lite -> gemini-2.5-flash -> gemini-3.5-flash (maxOutputTokens=180, thinkingBudget=0)
+ *     2. Core Engine v3.5 (Backup):  gemini-3.5-flash -> gemini-2.5-flash-lite -> gemini-2.5-flash (maxOutputTokens=220, thinkingBudget=0)
+ * - Supports compact top-6 long-term memory injection (<= 100 tokens) and optional "save_memory" JSON field.
+ * - Supports real-time Multimodal Live WebSocket audio streaming (BidiGenerateContent) for "With AI Voice".
+ */
 class GeminiApiClient {
 
     companion object {
-        // Strictly locked internal neural engine identifiers (never exposed in UI strings)
-        const val MODEL_NAME = "gemini-3.5-flash"
+        // Strictly internal model IDs (NEVER exposed in user-visible UI strings)
+        const val MODEL_V25_LITE = "gemini-2.5-flash-lite"
+        const val MODEL_V25_FLASH = "gemini-2.5-flash"
+        const val MODEL_V35_FLASH = "gemini-3.5-flash"
         const val LIVE_AUDIO_MODEL_NAME = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 
-        private const val GENERATE_ENDPOINT_URL =
-            "https://generativelanguage.googleapis.com/v1beta/models/$MODEL_NAME:generateContent"
-        private const val STREAM_ENDPOINT_URL =
-            "https://generativelanguage.googleapis.com/v1beta/models/$MODEL_NAME:streamGenerateContent?alt=sse"
+        private const val API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
         private const val BIDI_LIVE_WS_BASE_URL =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
@@ -155,7 +161,7 @@ class GeminiApiClient {
 
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(40, TimeUnit.SECONDS)
+        .readTimeout(35, TimeUnit.SECONDS)
         .writeTimeout(12, TimeUnit.SECONDS)
         .pingInterval(15, TimeUnit.SECONDS)
         .build()
@@ -169,67 +175,99 @@ class GeminiApiClient {
         runCatching { ws?.close(1000, "Cancelled") }
     }
 
-    suspend fun verifyApiKey(rawApiKey: String): KeyVerificationResult = withContext(Dispatchers.IO) {
+    private fun resolveEngineChain(selectedEngine: String): List<EngineModelSpec> {
+        return if (selectedEngine == ENGINE_V35_DEEP) {
+            listOf(
+                EngineModelSpec(MODEL_V35_FLASH, maxOutputTokens = 220, thinkingBudget = 0),
+                EngineModelSpec(MODEL_V25_LITE, maxOutputTokens = 180, thinkingBudget = 0),
+                EngineModelSpec(MODEL_V25_FLASH, maxOutputTokens = 180, thinkingBudget = 0)
+            )
+        } else {
+            listOf(
+                EngineModelSpec(MODEL_V25_LITE, maxOutputTokens = 180, thinkingBudget = 0),
+                EngineModelSpec(MODEL_V25_FLASH, maxOutputTokens = 180, thinkingBudget = 0),
+                EngineModelSpec(MODEL_V35_FLASH, maxOutputTokens = 220, thinkingBudget = 0)
+            )
+        }
+    }
+
+    private fun generateUrl(modelId: String) = "$API_BASE_URL/$modelId:generateContent"
+    private fun streamUrl(modelId: String) = "$API_BASE_URL/$modelId:streamGenerateContent?alt=sse"
+
+    private fun shouldFailoverHttpCode(code: Int): Boolean {
+        return code == 404 || code == 429 || code == 500 || code == 503
+    }
+
+    suspend fun verifyApiKey(
+        rawApiKey: String,
+        selectedEngine: String = ENGINE_V25_LITE
+    ): KeyVerificationResult = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
         if (apiKey.isEmpty()) {
             return@withContext KeyVerificationResult.Invalid("API key is empty. Enter a valid JARVIS AI Core key.")
         }
 
-        val startTime = System.currentTimeMillis()
-        try {
-            val payload = JSONObject().apply {
-                put(
-                    "contents",
-                    JSONArray().put(
+        val chain = resolveEngineChain(selectedEngine)
+        var lastError = "Unable to verify JARVIS AI Core key."
+
+        for (spec in chain) {
+            val startTime = System.currentTimeMillis()
+            try {
+                val payload = JSONObject().apply {
+                    put(
+                        "contents",
+                        JSONArray().put(
+                            JSONObject().apply {
+                                put("role", "user")
+                                put("parts", JSONArray().put(JSONObject().put("text", "Reply OK")))
+                            }
+                        )
+                    )
+                    put(
+                        "generationConfig",
                         JSONObject().apply {
-                            put("role", "user")
-                            put("parts", JSONArray().put(JSONObject().put("text", "Reply with OK")))
+                            put("maxOutputTokens", 8)
+                            put("temperature", 0.0)
                         }
                     )
-                )
-                put(
-                    "generationConfig",
-                    JSONObject().apply {
-                        put("maxOutputTokens", 8)
-                        put("temperature", 0.0)
+                }
+
+                val request = Request.Builder()
+                    .url(generateUrl(spec.modelId))
+                    .header("x-goog-api-key", apiKey)
+                    .header("Content-Type", "application/json")
+                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    val latency = System.currentTimeMillis() - startTime
+                    val responseBody = response.body?.string().orEmpty()
+                    if (response.isSuccessful) {
+                        return@withContext KeyVerificationResult.Valid(latencyMs = latency)
                     }
-                )
-            }
-
-            val request = Request.Builder()
-                .url(GENERATE_ENDPOINT_URL)
-                .header("x-goog-api-key", apiKey)
-                .header("Content-Type", "application/json")
-                .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
-                .build()
-
-            httpClient.newCall(request).execute().use { response ->
-                val latency = System.currentTimeMillis() - startTime
-                val responseBody = response.body?.string().orEmpty()
-                if (response.isSuccessful) {
-                    KeyVerificationResult.Valid(latencyMs = latency)
-                } else {
                     val apiError = sanitizeErrorText(extractApiErrorMessage(responseBody))
-                    val friendly = when (response.code) {
+                    lastError = when (response.code) {
                         400 -> "Invalid request (400): ${apiError.ifBlank { "Check your API key format." }}"
                         401, 403 -> "Authentication failed (${response.code}): API key rejected."
-                        404 -> "JARVIS AI Core endpoint unavailable (404)."
+                        404 -> "Engine endpoint unavailable (404)."
                         429 -> "Rate limit reached (429): Quota temporarily exceeded."
                         else -> "Connection error (${response.code}): ${apiError.ifBlank { response.message }}"
                     }
-                    KeyVerificationResult.Invalid(friendly)
+                    if (!shouldFailoverHttpCode(response.code)) {
+                        return@withContext KeyVerificationResult.Invalid(lastError)
+                    }
                 }
+            } catch (e: Exception) {
+                lastError = "Network error: ${sanitizeErrorText(e.localizedMessage ?: "Unable to reach JARVIS AI Core.")}"
+                return@withContext KeyVerificationResult.Invalid(lastError)
             }
-        } catch (e: Exception) {
-            KeyVerificationResult.Invalid("Network error: ${e.localizedMessage ?: "Unable to reach JARVIS AI Core."}")
         }
+        KeyVerificationResult.Invalid(lastError)
     }
 
     /**
      * Real-time Multimodal Live WebSocket audio streaming for "With AI Voice" mode.
-     * Connects to BidiGenerateContent using models/gemini-2.5-flash-native-audio-preview-12-2025,
-     * requests response_modalities: ["AUDIO"] with selectable deep male voice ("Charon" or "Fenrir"),
-     * and streams incoming 24kHz 16-bit PCM chunks directly to [onPcmChunk] as they arrive (~400ms latency).
+     * Streams incoming 24kHz 16-bit PCM chunks directly into AudioTrack (~400ms latency).
      */
     suspend fun streamLiveAiVoice(
         rawApiKey: String,
@@ -333,13 +371,11 @@ class GeminiApiClient {
             try {
                 val root = JSONObject(rawJson)
 
-                // Handle setupComplete handshake -> send client text turn
                 if (root.has("setupComplete") && promptSent.compareAndSet(false, true)) {
                     webSocket.send(buildClientTurnJson())
                     return
                 }
 
-                // Handle server error frame
                 if (root.has("error")) {
                     val errMsg = sanitizeErrorText(root.optJSONObject("error")?.optString("message").orEmpty())
                     completion.complete(Result.failure(IllegalStateException(errMsg.ifBlank { "Live audio error" })))
@@ -379,10 +415,7 @@ class GeminiApiClient {
             }
         }
 
-        val request = Request.Builder()
-            .url(wsUrl)
-            .build()
-
+        val request = Request.Builder().url(wsUrl).build()
         val ws = httpClient.newWebSocket(
             request,
             object : WebSocketListener() {
@@ -397,18 +430,14 @@ class GeminiApiClient {
                 }
 
                 override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                    // Multimodal Live WebSocket typically sends JSON envelopes as binary UTF-8 frames
                     handleServerJsonFrame(webSocket, bytes.utf8())
                 }
 
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                     val total = chunkCount.get()
                     if (!completion.isCompleted) {
-                        if (total > 0) {
-                            completion.complete(Result.success(total))
-                        } else {
-                            completion.complete(Result.failure(IllegalStateException("Live audio stream closed ($code).")))
-                        }
+                        if (total > 0) completion.complete(Result.success(total))
+                        else completion.complete(Result.failure(IllegalStateException("Live audio stream closed ($code).")))
                     }
                     runCatching { webSocket.close(1000, null) }
                 }
@@ -416,32 +445,24 @@ class GeminiApiClient {
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     if (!completion.isCompleted) {
                         val total = chunkCount.get()
-                        if (total > 0) {
-                            completion.complete(Result.success(total))
-                        } else {
-                            completion.complete(
-                                Result.failure(
-                                    IllegalStateException(
-                                        sanitizeErrorText(t.localizedMessage ?: "Live audio WebSocket unavailable.")
-                                    )
-                                )
+                        if (total > 0) completion.complete(Result.success(total))
+                        else completion.complete(
+                            Result.failure(
+                                IllegalStateException(sanitizeErrorText(t.localizedMessage ?: "Live audio unavailable."))
                             )
-                        }
+                        )
                     }
                 }
             }
         )
         activeVoiceWebSocket = ws
 
-        val outcome = withTimeoutOrNull(22_000L) {
+        val outcome = withTimeoutOrNull(20_000L) {
             completion.await()
         } ?: run {
             runCatching { ws.close(1000, "Timeout") }
-            if (chunkCount.get() > 0) {
-                Result.success(chunkCount.get())
-            } else {
-                Result.failure(IllegalStateException("Live AI Voice WebSocket timed out."))
-            }
+            if (chunkCount.get() > 0) Result.success(chunkCount.get())
+            else Result.failure(IllegalStateException("Live AI Voice WebSocket timed out."))
         }
 
         if (activeVoiceWebSocket === ws) {
@@ -451,8 +472,8 @@ class GeminiApiClient {
     }
 
     /**
-     * Ultra-fast real-time SSE streaming conversational reply using gemini-3.5-flash.
-     * Buffers any accidental JSON/markdown wrapper before emitting so TTS NEVER speaks "json", "{", or "reply".
+     * Ultra-fast token-optimized SSE streaming conversational reply with automatic Core Engine failover,
+     * thinkingBudget = 0, strict maxOutputTokens cap, and compact top-6 long-term memory injection.
      */
     suspend fun streamConversationalReply(
         rawApiKey: String,
@@ -460,6 +481,8 @@ class GeminiApiClient {
         userPrompt: String,
         recentHistory: List<ChatHistoryEntity> = emptyList(),
         extraSystemGuidance: String = "",
+        selectedEngine: String = ENGINE_V25_LITE,
+        memoryContext: String = "",
         onSentenceReady: suspend (String) -> Unit
     ): Result<String> = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
@@ -469,68 +492,115 @@ class GeminiApiClient {
             )
         }
 
-        try {
-            val systemText = buildString {
-                append(masterSystemPrompt.ifBlank { DEFAULT_MASTER_PROMPT })
+        val systemText = buildString {
+            append(masterSystemPrompt.ifBlank { DEFAULT_MASTER_PROMPT })
+            appendLine()
+            appendLine("IDENTITY & VOICE OUTPUT RULES:")
+            appendLine("- You are JARVIS, developed by Mozahid. Never mention any external AI brand or model name.")
+            appendLine("- Respond ONLY in clean, natural spoken sentences (1-2 short sentences). NEVER output JSON, brackets, markdown fences, asterisks, or bullet lists.")
+            if (memoryContext.isNotBlank()) {
                 appendLine()
-                appendLine("IDENTITY & VOICE OUTPUT RULES:")
-                appendLine("- You are JARVIS, developed by Mozahid. Never mention any external AI brand or model name.")
-                appendLine("- Respond ONLY in clean, natural spoken sentences. NEVER output JSON, brackets, markdown fences, asterisks, or bullet lists.")
-                appendLine("- Keep sentences crisp and conversational so real-time voice synthesis sounds immediate.")
-                if (extraSystemGuidance.isNotBlank()) {
-                    appendLine(extraSystemGuidance)
-                }
+                appendLine("USER LONG-TERM MEMORY:")
+                appendLine(memoryContext)
             }
+            if (extraSystemGuidance.isNotBlank()) {
+                appendLine(extraSystemGuidance)
+            }
+        }
 
-            val contentsArray = JSONArray()
-            for (entry in recentHistory.takeLast(4)) {
-                contentsArray.put(
-                    JSONObject().apply {
-                        put("role", "user")
-                        put("parts", JSONArray().put(JSONObject().put("text", entry.userTranscript)))
-                    }
-                )
-                contentsArray.put(
-                    JSONObject().apply {
-                        put("role", "model")
-                        put(
-                            "parts",
-                            JSONArray().put(
-                                JSONObject().put(
-                                    "text",
-                                    JarvisResponseSanitizer.extractCleanReply(entry.jarvisReply)
-                                )
-                            )
-                        )
-                    }
-                )
-            }
+        val contentsArray = JSONArray()
+        for (entry in recentHistory.takeLast(3)) {
             contentsArray.put(
                 JSONObject().apply {
                     put("role", "user")
-                    put("parts", JSONArray().put(JSONObject().put("text", userPrompt)))
+                    put("parts", JSONArray().put(JSONObject().put("text", entry.userTranscript)))
                 }
             )
+            contentsArray.put(
+                JSONObject().apply {
+                    put("role", "model")
+                    put(
+                        "parts",
+                        JSONArray().put(
+                            JSONObject().put("text", JarvisResponseSanitizer.extractCleanReply(entry.jarvisReply))
+                        )
+                    )
+                }
+            )
+        }
+        contentsArray.put(
+            JSONObject().apply {
+                put("role", "user")
+                put("parts", JSONArray().put(JSONObject().put("text", userPrompt)))
+            }
+        )
 
+        val chain = resolveEngineChain(selectedEngine)
+        var lastError: Throwable = IllegalStateException("Unable to reach JARVIS AI Core.")
+
+        for (spec in chain) {
+            val attempt = executeConversationalStreamOnce(
+                apiKey = apiKey,
+                spec = spec,
+                systemText = systemText,
+                contentsArray = contentsArray,
+                includeThinkingConfig = true,
+                onSentenceReady = onSentenceReady
+            )
+
+            if (attempt.isSuccess) {
+                return@withContext Result.success(attempt.getOrThrow())
+            }
+            val err = attempt.exceptionOrNull()
+            if (err is ThinkingConfigUnsupportedException) {
+                val retryNoThinking = executeConversationalStreamOnce(
+                    apiKey = apiKey,
+                    spec = spec,
+                    systemText = systemText,
+                    contentsArray = contentsArray,
+                    includeThinkingConfig = false,
+                    onSentenceReady = onSentenceReady
+                )
+                if (retryNoThinking.isSuccess) {
+                    return@withContext Result.success(retryNoThinking.getOrThrow())
+                }
+                lastError = retryNoThinking.exceptionOrNull() ?: lastError
+                if (lastError !is FailoverHttpException) break
+            } else if (err is FailoverHttpException) {
+                lastError = err
+                continue
+            } else {
+                return@withContext Result.failure(err ?: lastError)
+            }
+        }
+
+        Result.failure(lastError)
+    }
+
+    private suspend fun executeConversationalStreamOnce(
+        apiKey: String,
+        spec: EngineModelSpec,
+        systemText: String,
+        contentsArray: JSONArray,
+        includeThinkingConfig: Boolean,
+        onSentenceReady: suspend (String) -> Unit
+    ): Result<String> {
+        return try {
+            val genConfig = JSONObject().apply {
+                put("temperature", 0.4)
+                put("maxOutputTokens", spec.maxOutputTokens)
+                if (includeThinkingConfig) {
+                    put("thinkingConfig", JSONObject().put("thinkingBudget", spec.thinkingBudget))
+                }
+            }
             val payload = JSONObject().apply {
-                put(
-                    "systemInstruction",
-                    JSONObject().apply {
-                        put("parts", JSONArray().put(JSONObject().put("text", systemText)))
-                    }
-                )
+                put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemText))))
                 put("contents", contentsArray)
-                put(
-                    "generationConfig",
-                    JSONObject().apply {
-                        put("temperature", 0.45)
-                        put("maxOutputTokens", 512)
-                    }
-                )
+                put("generationConfig", genConfig)
             }
 
             val request = Request.Builder()
-                .url(STREAM_ENDPOINT_URL)
+                .url(streamUrl(spec.modelId))
                 .header("x-goog-api-key", apiKey)
                 .header("Content-Type", "application/json")
                 .header("Accept", "text/event-stream")
@@ -545,14 +615,19 @@ class GeminiApiClient {
             httpClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     val body = response.body?.string().orEmpty()
-                    val err = sanitizeErrorText(extractApiErrorMessage(body))
-                    return@withContext Result.failure(
-                        IllegalStateException("JARVIS AI Core error ${response.code}: ${err.ifBlank { response.message }}")
-                    )
+                    val apiMsg = sanitizeErrorText(extractApiErrorMessage(body))
+                    if (response.code == 400 && includeThinkingConfig && body.contains("thinking", ignoreCase = true)) {
+                        return Result.failure(ThinkingConfigUnsupportedException())
+                    }
+                    val message = "JARVIS AI Core error ${response.code}: ${apiMsg.ifBlank { response.message }}"
+                    if (shouldFailoverHttpCode(response.code)) {
+                        return Result.failure(FailoverHttpException(response.code, message))
+                    }
+                    return Result.failure(IllegalStateException(message))
                 }
 
                 val source = response.body?.source()
-                    ?: return@withContext Result.failure(IllegalStateException("Empty response stream from JARVIS AI Core."))
+                    ?: return Result.failure(IllegalStateException("Empty response stream from JARVIS AI Core."))
 
                 while (!source.exhausted()) {
                     val line = source.readUtf8Line() ?: break
@@ -566,7 +641,6 @@ class GeminiApiClient {
                     fullText.append(chunkText)
                     sentenceBuffer.append(chunkText)
 
-                    // Guard: if the model unexpectedly begins outputting ```json or { ... }, hold until complete to extract ONLY "reply"
                     val trimmedStart = fullText.toString().trimStart()
                     if (!emittedAnySentence && (
                             trimmedStart.startsWith("{") ||
@@ -599,7 +673,7 @@ class GeminiApiClient {
                 val cleanReply = JarvisResponseSanitizer.extractCleanReply(fullText.toString())
                 if (cleanReply.isNotEmpty()) {
                     onSentenceReady(cleanReply)
-                    return@withContext Result.success(cleanReply)
+                    return Result.success(cleanReply)
                 }
             } else {
                 val trailing = JarvisResponseSanitizer.sanitizePlainSpeechText(sentenceBuffer.toString())
@@ -620,8 +694,8 @@ class GeminiApiClient {
     }
 
     /**
-     * Autonomous multi-step phone automation decision call on gemini-3.5-flash.
-     * Strictly parses JSON and sanitizes the "reply" field so brackets or JSON keys never reach TTS/UI.
+     * Autonomous multi-step phone automation decision call with Engine v2.5 / v3.5 selection,
+     * automatic failover, thinkingBudget=0, compact 25-node UI JSON, top-6 memories, and optional "save_memory".
      */
     suspend fun requestAgentAction(
         rawApiKey: String,
@@ -631,7 +705,9 @@ class GeminiApiClient {
         recentHistory: List<ChatHistoryEntity>,
         stepHistory: List<String> = emptyList(),
         stepIndex: Int = 1,
-        maxSteps: Int = 8
+        maxSteps: Int = 8,
+        selectedEngine: String = ENGINE_V25_LITE,
+        memoryContext: String = ""
     ): Result<JarvisAiAction> = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
         if (apiKey.isEmpty()) {
@@ -641,11 +717,11 @@ class GeminiApiClient {
         }
 
         try {
-            val combinedSystemPrompt = buildSystemInstruction(masterSystemPrompt)
+            val combinedSystemPrompt = buildSystemInstruction(masterSystemPrompt, memoryContext)
             val contentsArray = JSONArray()
 
             if (stepIndex == 1) {
-                for (entry in recentHistory.takeLast(3)) {
+                for (entry in recentHistory.takeLast(2)) {
                     contentsArray.put(
                         JSONObject().apply {
                             put("role", "user")
@@ -674,18 +750,13 @@ class GeminiApiClient {
             }
 
             val turnPrompt = buildString {
-                appendLine("USER GOAL:")
-                appendLine(userQuery)
-                appendLine("STEP: $stepIndex of $maxSteps")
+                appendLine("GOAL: $userQuery")
+                appendLine("STEP: $stepIndex/$maxSteps")
                 if (stepHistory.isNotEmpty()) {
-                    appendLine("COMPLETED STEPS SO FAR:")
-                    stepHistory.forEachIndexed { idx, s -> appendLine("${idx + 1}. $s") }
+                    appendLine("DONE: ${stepHistory.joinToString(" | ")}")
                 }
                 if (!screenContextJson.isNullOrBlank()) {
-                    appendLine("CURRENT SCREEN UI JSON:")
-                    appendLine(screenContextJson)
-                } else {
-                    appendLine("CURRENT SCREEN UI JSON: unavailable (Accessibility Service inactive).")
+                    appendLine("UI: $screenContextJson")
                 }
             }
 
@@ -696,25 +767,14 @@ class GeminiApiClient {
                 }
             )
 
-            val payload = JSONObject().apply {
-                put(
-                    "systemInstruction",
-                    JSONObject().apply {
-                        put("parts", JSONArray().put(JSONObject().put("text", combinedSystemPrompt)))
-                    }
-                )
-                put("contents", contentsArray)
-                put(
-                    "generationConfig",
-                    JSONObject().apply {
-                        put("temperature", 0.18)
-                        put("responseMimeType", "application/json")
-                        put("maxOutputTokens", 384)
-                    }
-                )
-            }
-
-            val rawModelText = executeStreamingCollect(apiKey, payload).getOrElse { err ->
+            val rawModelText = executeCollectWithEngineFailover(
+                apiKey = apiKey,
+                selectedEngine = selectedEngine,
+                systemText = combinedSystemPrompt,
+                contentsArray = contentsArray,
+                temperature = 0.15,
+                jsonOutput = true
+            ).getOrElse { err ->
                 return@withContext Result.failure(err)
             }
 
@@ -738,7 +798,8 @@ class GeminiApiClient {
         senderName: String,
         appLabel: String,
         incomingMessage: String,
-        recentConversation: List<AutoChatLogsEntity>
+        recentConversation: List<AutoChatLogsEntity>,
+        selectedEngine: String = ENGINE_V25_LITE
     ): Result<String> = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
         if (apiKey.isEmpty()) {
@@ -750,51 +811,37 @@ class GeminiApiClient {
                 append(masterSystemPrompt.ifBlank { DEFAULT_MASTER_PROMPT })
                 appendLine()
                 appendLine("AUTONOMOUS CHAT AUTO-REPLY MODE:")
-                appendLine("- You are replying on the user's behalf in $appLabel to \"$senderName\".")
-                appendLine("- Sound completely natural, warm, concise, and human-like (1-2 short casual sentences max).")
-                appendLine("- Match the sender's language (Hindi, Hinglish, or English) automatically.")
-                appendLine("- Output ONLY the exact message text to send. Never output JSON or mention any AI brand.")
+                appendLine("- Reply on the user's behalf in $appLabel to \"$senderName\".")
+                appendLine("- Natural, warm, concise (1-2 short sentences), matching the sender's language.")
+                appendLine("- Output ONLY the exact message text to send. Never output JSON or external AI brands.")
             }
 
             val convoHistory = buildString {
                 if (recentConversation.isNotEmpty()) {
-                    appendLine("RECENT CHAT CONTEXT WITH $senderName:")
-                    recentConversation.takeLast(8).forEach { log ->
+                    appendLine("RECENT CHAT:")
+                    recentConversation.takeLast(6).forEach { log ->
                         val who = if (log.direction == AUTO_CHAT_DIR_INCOMING) senderName else "Me"
                         appendLine("$who: ${log.messageText}")
                     }
-                    appendLine()
                 }
-                appendLine("LATEST MESSAGE FROM $senderName:")
-                appendLine(incomingMessage)
+                appendLine("LATEST FROM $senderName: $incomingMessage")
             }
 
-            val payload = JSONObject().apply {
-                put(
-                    "systemInstruction",
-                    JSONObject().apply {
-                        put("parts", JSONArray().put(JSONObject().put("text", systemText)))
-                    }
-                )
-                put(
-                    "contents",
-                    JSONArray().put(
-                        JSONObject().apply {
-                            put("role", "user")
-                            put("parts", JSONArray().put(JSONObject().put("text", convoHistory)))
-                        }
-                    )
-                )
-                put(
-                    "generationConfig",
-                    JSONObject().apply {
-                        put("temperature", 0.55)
-                        put("maxOutputTokens", 140)
-                    }
-                )
-            }
+            val contentsArray = JSONArray().put(
+                JSONObject().apply {
+                    put("role", "user")
+                    put("parts", JSONArray().put(JSONObject().put("text", convoHistory)))
+                }
+            )
 
-            executeStreamingCollect(apiKey, payload).map { text ->
+            executeCollectWithEngineFailover(
+                apiKey = apiKey,
+                selectedEngine = selectedEngine,
+                systemText = systemText,
+                contentsArray = contentsArray,
+                temperature = 0.5,
+                jsonOutput = false
+            ).map { text ->
                 JarvisResponseSanitizer.extractCleanReply(text).take(400)
             }
         } catch (e: Exception) {
@@ -802,9 +849,79 @@ class GeminiApiClient {
         }
     }
 
-    private fun executeStreamingCollect(apiKey: String, payload: JSONObject): Result<String> {
+    private fun executeCollectWithEngineFailover(
+        apiKey: String,
+        selectedEngine: String,
+        systemText: String,
+        contentsArray: JSONArray,
+        temperature: Double,
+        jsonOutput: Boolean
+    ): Result<String> {
+        val chain = resolveEngineChain(selectedEngine)
+        var lastError: Throwable = IllegalStateException("Unable to reach JARVIS AI Core.")
+
+        for (spec in chain) {
+            val attempt = executeStreamingCollectOnce(
+                apiKey = apiKey,
+                spec = spec,
+                systemText = systemText,
+                contentsArray = contentsArray,
+                temperature = temperature,
+                jsonOutput = jsonOutput,
+                includeThinkingConfig = true
+            )
+            if (attempt.isSuccess) return attempt
+            val err = attempt.exceptionOrNull()
+            if (err is ThinkingConfigUnsupportedException) {
+                val retry = executeStreamingCollectOnce(
+                    apiKey = apiKey,
+                    spec = spec,
+                    systemText = systemText,
+                    contentsArray = contentsArray,
+                    temperature = temperature,
+                    jsonOutput = jsonOutput,
+                    includeThinkingConfig = false
+                )
+                if (retry.isSuccess) return retry
+                lastError = retry.exceptionOrNull() ?: lastError
+                if (lastError !is FailoverHttpException) break
+            } else if (err is FailoverHttpException) {
+                lastError = err
+                continue
+            } else {
+                return Result.failure(err ?: lastError)
+            }
+        }
+        return Result.failure(lastError)
+    }
+
+    private fun executeStreamingCollectOnce(
+        apiKey: String,
+        spec: EngineModelSpec,
+        systemText: String,
+        contentsArray: JSONArray,
+        temperature: Double,
+        jsonOutput: Boolean,
+        includeThinkingConfig: Boolean
+    ): Result<String> {
+        val genConfig = JSONObject().apply {
+            put("temperature", temperature)
+            put("maxOutputTokens", spec.maxOutputTokens)
+            if (jsonOutput) {
+                put("responseMimeType", "application/json")
+            }
+            if (includeThinkingConfig) {
+                put("thinkingConfig", JSONObject().put("thinkingBudget", spec.thinkingBudget))
+            }
+        }
+        val payload = JSONObject().apply {
+            put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemText))))
+            put("contents", contentsArray)
+            put("generationConfig", genConfig)
+        }
+
         val request = Request.Builder()
-            .url(STREAM_ENDPOINT_URL)
+            .url(streamUrl(spec.modelId))
             .header("x-goog-api-key", apiKey)
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
@@ -814,10 +931,15 @@ class GeminiApiClient {
         httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 val body = response.body?.string().orEmpty()
+                if (response.code == 400 && includeThinkingConfig && body.contains("thinking", ignoreCase = true)) {
+                    return Result.failure(ThinkingConfigUnsupportedException())
+                }
                 val err = sanitizeErrorText(extractApiErrorMessage(body))
-                return Result.failure(
-                    IllegalStateException("JARVIS AI Core error ${response.code}: ${err.ifBlank { response.message }}")
-                )
+                val msg = "JARVIS AI Core error ${response.code}: ${err.ifBlank { response.message }}"
+                if (shouldFailoverHttpCode(response.code)) {
+                    return Result.failure(FailoverHttpException(response.code, msg))
+                }
+                return Result.failure(IllegalStateException(msg))
             }
 
             val source = response.body?.source()
@@ -864,46 +986,29 @@ class GeminiApiClient {
         return raw.replace(Regex("(?i)gemini[\\w.-]*"), "JARVIS Core").trim()
     }
 
-    private fun buildSystemInstruction(userMasterPrompt: String): String {
-        return """
-${userMasterPrompt.ifBlank { DEFAULT_MASTER_PROMPT }}
-
-CRITICAL AUTONOMOUS MULTI-STEP AGENT PROTOCOL (STRICT JSON ONLY):
+    private fun buildSystemInstruction(userMasterPrompt: String, memoryContext: String): String {
+        return buildString {
+            append(userMasterPrompt.ifBlank { DEFAULT_MASTER_PROMPT })
+            if (memoryContext.isNotBlank()) {
+                appendLine()
+                appendLine("USER MEMORY:")
+                appendLine(memoryContext)
+            }
+            appendLine()
+            append(
+                """
+COMPACT AGENT PROTOCOL (STRICT SINGLE JSON OBJECT ONLY):
 You are JARVIS, developed by Mozahid. Never mention any external AI brand.
-You MUST respond with a single valid JSON object matching this exact schema:
-{
-  "action": "OPEN_APP" | "TAP_TEXT" | "TAP_XY" | "LONG_PRESS" | "TYPE_TEXT" | "SWIPE" | "SCROLL_DOWN" | "SCROLL_UP" | "SCROLL" | "DRAG" | "MULTI_TOUCH" | "BACK" | "HOME" | "RECENTS" | "GLOBAL" | "DONE" | "SPEAK",
-  "params": { ... },
-  "reply": "Short clean spoken sentence for the user with no markdown or symbols"
-}
-
-MULTI-STEP RULES:
-- Execute ONE immediate next action toward the USER GOAL based on CURRENT SCREEN UI JSON (each node has id, text, desc, x, y, clickable, editable, scrollable).
-- For multi-step goals (e.g., open YouTube -> tap search -> type song with submit:true -> tap first video; or open WhatsApp -> tap contact -> type message -> tap Send; or open Settings -> tap Network/Hotspot -> toggle on), execute the next logical step now. You will automatically receive the updated screen after 900ms!
-- As soon as the user's goal is completely achieved, return "action": "DONE" with a crisp final spoken confirmation in "reply".
-- If no screen action is needed, return "action": "SPEAK".
-
-PARAMS SPECIFICATION BY ACTION:
-- "OPEN_APP": {"appName": "YouTube", "packageName": "optional.package.name"}
-- "TAP_TEXT": {"text": "visible label or button text"}
-- "TAP_XY": {"x": 540, "y": 1200}
-- "LONG_PRESS": {"x": 540, "y": 1200, "durationMs": 750}
-- "TYPE_TEXT": {"text": "text to enter", "target": "optional field label", "submit": true}
-- "SWIPE": {"x1": 540, "y1": 1600, "x2": 540, "y2": 500, "durationMs": 320}
-- "SCROLL_DOWN": {}
-- "SCROLL_UP": {}
-- "SCROLL": {"direction": "SCROLL_UP" | "SCROLL_DOWN" | "SCROLL_LEFT" | "SCROLL_RIGHT"}
-- "DRAG": {"startX": 300, "startY": 1000, "endX": 800, "endY": 600, "durationMs": 420} OR {"angleDegrees": 45, "distancePx": 400, "durationMs": 420}
-- "MULTI_TOUCH": {"gesture": "PINCH_IN" | "PINCH_OUT" | "ROTATE" | "TWO_FINGER_SWIPE" | "MULTI_TAP", "direction": "UP|DOWN|LEFT|RIGHT", "degrees": 45, "spreadPx": 260, "points": [{"x": 200, "y": 900}, {"x": 880, "y": 900}]}
-- "BACK": {}
-- "HOME": {}
-- "RECENTS": {}
-- "GLOBAL": {"command": "HOME" | "BACK" | "RECENTS" | "NOTIFICATIONS" | "QUICK_SETTINGS" | "SCREENSHOT" | "LOCK_SCREEN" | "FLASHLIGHT_ON" | "FLASHLIGHT_OFF" | "VOLUME_UP" | "VOLUME_DOWN" | "WIFI" | "BLUETOOTH" | "DND" | "CLIPBOARD_READ" | "CLIPBOARD_COPY" | "CALL", "target": "optional text or phone/contact"}
-- "DONE": {}
-- "SPEAK": {}
-
-Never include markdown fences or commentary outside the JSON object.
-        """.trimIndent()
+Schema:
+{"action":"OPEN_APP|TAP_TEXT|TAP_XY|LONG_PRESS|TYPE_TEXT|SWIPE|SCROLL_DOWN|SCROLL_UP|SCROLL|DRAG|MULTI_TOUCH|BACK|HOME|RECENTS|GLOBAL|DONE|SPEAK","params":{},"reply":"Short clean spoken sentence","save_memory":"optional short user fact to remember or empty"}
+Rules:
+- Execute ONE next action using UI nodes (id,text,x,y). Return DONE once goal completes, SPEAK if no action needed.
+- Params: OPEN_APP{"appName"}, TAP_TEXT{"text"}, TAP_XY{"x","y"}, TYPE_TEXT{"text","submit":true}, SWIPE{"x1","y1","x2","y2"}, SCROLL{"direction"}, DRAG{"startX","startY","endX","endY"}, MULTI_TOUCH{"gesture"}, GLOBAL{"command","target"}.
+- Only fill "save_memory" when user shares a new personal fact/preference/routine worth remembering permanently.
+- No markdown fences or text outside JSON.
+                """.trimIndent()
+            )
+        }
     }
 
     private fun extractCandidateText(rawResponse: String): String {
@@ -941,15 +1046,24 @@ Never include markdown fences or commentary outside the JSON object.
             val cleanReply = JarvisResponseSanitizer.sanitizePlainSpeechText(
                 obj.optString("reply", "")
             ).ifBlank { "Done, sir." }
-            JarvisAiAction(action = action, params = params, reply = cleanReply)
+            val saveMem = obj.optString("save_memory", "")
+                .trim()
+                .takeIf { it.length >= 4 && !it.equals("null", ignoreCase = true) }
+            JarvisAiAction(
+                action = action,
+                params = params,
+                reply = cleanReply,
+                saveMemory = saveMem
+            )
         } catch (_: Exception) {
             val cleanFallback = JarvisResponseSanitizer.extractCleanReply(rawText)
-                .take(360)
+                .take(320)
                 .ifBlank { "Command processed, sir." }
             JarvisAiAction(
                 action = "SPEAK",
                 params = JSONObject(),
-                reply = cleanFallback
+                reply = cleanFallback,
+                saveMemory = null
             )
         }
     }
@@ -961,4 +1075,7 @@ Never include markdown fences or commentary outside the JSON object.
             ""
         }
     }
+
+    private class ThinkingConfigUnsupportedException : Exception()
+    private class FailoverHttpException(val code: Int, message: String) : Exception(message)
 }

@@ -178,6 +178,7 @@ private fun JarvisRootApp(
     val history by viewModel.chatHistory.collectAsStateWithLifecycle()
     val macros by viewModel.macros.collectAsStateWithLifecycle()
     val scheduledCalls by viewModel.scheduledCalls.collectAsStateWithLifecycle()
+    val userMemories by viewModel.userMemories.collectAsStateWithLifecycle()
     val permissions by viewModel.permissionsState.collectAsStateWithLifecycle()
     val keyVerification by viewModel.keyVerificationState.collectAsStateWithLifecycle()
     val screenSummary by viewModel.screenSummary.collectAsStateWithLifecycle()
@@ -475,6 +476,7 @@ private fun JarvisRootApp(
                                 notificationListenerGranted = permissions.notificationListenerActive,
                                 wakeWordServiceRunning = wakeWordServiceRunning,
                                 scheduledCalls = scheduledCalls,
+                                userMemories = userMemories,
                                 onSaveSettings = viewModel::saveSettings,
                                 onVerifyApiKey = viewModel::verifyAiCoreApiKey,
                                 onResetVerification = viewModel::resetVerificationState,
@@ -486,6 +488,8 @@ private fun JarvisRootApp(
                                 onAddScheduledCall = viewModel::addScheduledCall,
                                 onToggleScheduledCall = viewModel::toggleScheduledCallEnabled,
                                 onDeleteScheduledCall = viewModel::deleteScheduledCall,
+                                onAddUserMemory = viewModel::addUserMemory,
+                                onDeleteUserMemory = viewModel::deleteUserMemory,
                                 onTestIncomingCall = viewModel::triggerTestIncomingCall,
                                 onTestScreenTap = ::runDiagnosticTapWithToast
                             )

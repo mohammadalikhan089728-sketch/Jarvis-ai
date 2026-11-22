@@ -24,6 +24,14 @@ class JarvisAgentEngine(
     private val offlineProcessor: OfflineCommandProcessor
 ) {
 
+    private val memoryManager = MemoryManager(repository)
+    private val localRouter = LocalCommandRouter(
+        appContext = appContext,
+        repository = repository,
+        offlineProcessor = offlineProcessor,
+        memoryManager = memoryManager
+    )
+
     suspend fun processCommand(
         rawQuery: String,
         settings: SettingsEntity,
@@ -36,6 +44,36 @@ class JarvisAgentEngine(
         val startMs = System.currentTimeMillis()
         val query = rawQuery.trim()
         val normalizedLower = query.lowercase(Locale.ROOT)
+
+        // 0. Zero-Token Local Instant Intent Router & <3-Char Noise Guard (0 API tokens)
+        when (val localRoute = localRouter.tryRoute(query, inActiveCall = false)) {
+            LocalRouteResult.IgnoredNoise -> {
+                return AgentExecutionResult(
+                    executedAction = "LOCAL:NOISE_IGNORED",
+                    paramsJson = "{}",
+                    reply = "",
+                    isOffline = true,
+                    latencyMs = 0L,
+                    alreadyStreamSpoken = true
+                )
+            }
+            is LocalRouteResult.Handled -> {
+                onPhaseUpdate(JarvisPhase.ACTING)
+                val res = AgentExecutionResult(
+                    executedAction = localRoute.actionTag,
+                    paramsJson = localRoute.paramsJson,
+                    reply = localRoute.reply,
+                    isOffline = true,
+                    latencyMs = System.currentTimeMillis() - startMs
+                )
+                logAndReturn(query, res)
+                return res
+            }
+            LocalRouteResult.NotHandled -> Unit
+        }
+
+        // Passively save personal facts/routines/goals shared naturally in conversation
+        memoryManager.detectAndSaveImplicitMemory(query)
 
         // 1. Voice-created Scheduled JARVIS Calls ("Kal subah 6 baje padhne ke liye call karna")
         handleVoiceScheduleCallCommand(query, normalizedLower, startMs)?.let { result ->
@@ -131,12 +169,15 @@ class JarvisAgentEngine(
         if (isPureConversationalQuery(normalizedLower)) {
             onPhaseUpdate(JarvisPhase.THINKING)
             val recentHistory = repository.getRecentHistory(limit = 4)
+            val memoryContext = memoryManager.buildCompactMemoryContext(query)
             var startedSpeaking = false
             val streamResult = aiClient.streamConversationalReply(
                 rawApiKey = settings.geminiApiKey,
                 masterSystemPrompt = settings.masterSystemPrompt,
                 userPrompt = query,
                 recentHistory = recentHistory,
+                selectedEngine = settings.coreEngine,
+                memoryContext = memoryContext,
                 onSentenceReady = { sentence ->
                     if (!startedSpeaking) {
                         startedSpeaking = true
@@ -301,6 +342,7 @@ class JarvisAgentEngine(
                     null
                 }
 
+                val memoryContext = memoryManager.buildCompactMemoryContext(goalQuery)
                 val aiResult = aiClient.requestAgentAction(
                     rawApiKey = settings.geminiApiKey,
                     masterSystemPrompt = settings.masterSystemPrompt,
@@ -309,7 +351,9 @@ class JarvisAgentEngine(
                     recentHistory = recentHistory,
                     stepHistory = stepHistory,
                     stepIndex = step,
-                    maxSteps = MAX_AGENT_STEPS
+                    maxSteps = MAX_AGENT_STEPS,
+                    selectedEngine = settings.coreEngine,
+                    memoryContext = memoryContext
                 )
 
                 val aiAction = aiResult.getOrElse { err ->
@@ -321,6 +365,11 @@ class JarvisAgentEngine(
                         isOffline = false,
                         latencyMs = elapsed
                     )
+                }
+
+                // Persist any long-term personal fact extracted by JARVIS AI Core
+                aiAction.saveMemory?.takeIf { it.isNotBlank() }?.let { fact ->
+                    memoryManager.saveMemory(fact, memoryManager.inferCategory(fact))
                 }
 
                 val actionUpper = aiAction.action.uppercase(Locale.ROOT)
@@ -536,6 +585,7 @@ class JarvisAgentEngine(
             rawApiKey = settings.geminiApiKey,
             masterSystemPrompt = settings.masterSystemPrompt,
             userPrompt = prompt,
+            selectedEngine = settings.coreEngine,
             onSentenceReady = { sentence ->
                 if (!started) {
                     started = true
@@ -639,6 +689,7 @@ class JarvisAgentEngine(
             rawApiKey = settings.geminiApiKey,
             masterSystemPrompt = settings.masterSystemPrompt,
             userPrompt = prompt,
+            selectedEngine = settings.coreEngine,
             onSentenceReady = { sentence ->
                 if (!started) {
                     started = true
@@ -733,15 +784,21 @@ class JarvisAgentEngine(
             val screenJson = if (settings.autoReadScreenContext) {
                 JarvisAccessibilityService.instance?.readScreenHierarchy()?.toCompactJson()
             } else null
+            val memoryContext = memoryManager.buildCompactMemoryContext(macro.actionPayload)
             val res = aiClient.requestAgentAction(
                 rawApiKey = settings.geminiApiKey,
                 masterSystemPrompt = settings.masterSystemPrompt,
                 userQuery = macro.actionPayload,
                 screenContextJson = screenJson,
-                recentHistory = emptyList()
+                recentHistory = emptyList(),
+                selectedEngine = settings.coreEngine,
+                memoryContext = memoryContext
             )
             return res.fold(
                 onSuccess = { action ->
+                    action.saveMemory?.takeIf { it.isNotBlank() }?.let { fact ->
+                        memoryManager.saveMemory(fact, memoryManager.inferCategory(fact))
+                    }
                     onPhaseUpdate(JarvisPhase.ACTING)
                     executeStructuredAction(action.action, action.params)
                     AgentExecutionResult(
