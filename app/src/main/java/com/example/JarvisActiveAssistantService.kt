@@ -201,6 +201,21 @@ class JarvisActiveAssistantService : Service() {
         attachFloatingMiniBubbleIfPermitted()
         startInactivityWatchdog()
 
+        // Pre-warm the single persistent Multimodal Live WebSocket when AI Voice mode is active
+        serviceScope.launch {
+            val currentSettings = repository.getSettings()
+            if (currentSettings.voiceMode == VOICE_MODE_AI_VOICE &&
+                currentSettings.geminiApiKey.isNotBlank() &&
+                !PersistentLiveAudioSession.isInQuotaCooldown()
+            ) {
+                PersistentLiveAudioSession.ensureConnected(
+                    rawApiKey = currentSettings.geminiApiKey,
+                    voiceName = currentSettings.aiVoiceName.ifBlank { AI_VOICE_CHARON },
+                    masterSystemPrompt = currentSettings.masterSystemPrompt
+                )
+            }
+        }
+
         if (!initialCommand.isNullOrBlank()) {
             submitCommandInternal(initialCommand)
         } else {
@@ -231,6 +246,7 @@ class JarvisActiveAssistantService : Service() {
                 _phase.value = JarvisPhase.SPEAKING
                 _statusBanner.value = "STANDBY"
                 voiceEngine.speak("Standing by, sir.", settings) {
+                    PersistentLiveAudioSession.closeSession("Session ended")
                     _phase.value = JarvisPhase.IDLE
                     stopForegroundCompat()
                     stopSelf()
@@ -238,6 +254,7 @@ class JarvisActiveAssistantService : Service() {
             }
         } else {
             voiceEngine.stop()
+            PersistentLiveAudioSession.closeSession("Session stopped")
             _phase.value = JarvisPhase.IDLE
             _statusBanner.value = "STANDBY"
             stopForegroundCompat()
@@ -271,6 +288,7 @@ class JarvisActiveAssistantService : Service() {
                 text = "No voice detected for 3 minutes. JARVIS entering standby mode.",
                 settings = settings
             ) {
+                PersistentLiveAudioSession.closeSession("Auto-sleep standby")
                 _phase.value = JarvisPhase.IDLE
                 stopForegroundCompat()
                 stopSelf()
@@ -490,8 +508,11 @@ class JarvisActiveAssistantService : Service() {
     }
 
     private fun isStopListeningCommand(spoken: String): Boolean {
-        val lower = spoken.lowercase(Locale.ROOT)
+        val lower = spoken.lowercase(Locale.ROOT).trim()
         return lower == "stop" ||
+            lower == "ruko" ||
+            lower == "jarvis ruko" ||
+            lower == "ruko jarvis" ||
             lower.contains("stop listening") ||
             lower.contains("sunna band") ||
             lower.contains("band karo") ||
@@ -517,12 +538,15 @@ class JarvisActiveAssistantService : Service() {
             _statusBanner.value = "Thinking…"
             _phase.value = JarvisPhase.THINKING
 
+            var streamCallbackArmed = false
+
             val result = agentEngine.processCommand(
                 rawQuery = clean,
                 settings = currentSettings,
                 onPhaseUpdate = { updatedPhase -> _phase.value = updatedPhase },
                 onStatusUpdate = { status -> _statusBanner.value = status },
                 onStreamStart = {
+                    streamCallbackArmed = true
                     voiceEngine.beginStreamingSpeech(
                         settings = currentSettings,
                         onAllFinished = { handlePostSpeechTurnTaking() }
@@ -549,6 +573,9 @@ class JarvisActiveAssistantService : Service() {
                 voiceEngine.speak(cleanReply, currentSettings) {
                     handlePostSpeechTurnTaking()
                 }
+            } else if (!streamCallbackArmed) {
+                // Turn was already spoken synchronously via PersistentLiveAudioSession — immediately resume hands-free loop!
+                handlePostSpeechTurnTaking()
             }
         }
     }
@@ -871,6 +898,7 @@ class JarvisActiveAssistantService : Service() {
         activeCommandJob?.cancel()
         destroySpeechRecognizer()
         removeFloatingMiniBubble()
+        PersistentLiveAudioSession.closeSession("Service destroyed")
         voiceEngine.shutdown()
         _isSessionActive.value = false
         _phase.value = JarvisPhase.IDLE

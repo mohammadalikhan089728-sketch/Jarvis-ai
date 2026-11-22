@@ -27,6 +27,7 @@ class BootReceiver : BroadcastReceiver() {
             try {
                 val appContext = context.applicationContext
                 CallAlarmScheduler.rescheduleAllEnabledCalls(appContext)
+                TaskSchedulerAndAutomationManager.rescheduleAllPendingTasks(appContext)
                 val repo = JarvisRepository(JarvisDatabase.getInstance(appContext))
                 val settings = repo.getSettings()
                 if (settings.alwaysOnWakeWordEnabled) {

@@ -52,6 +52,16 @@ class LocalCommandRouter(
         }
 
         val lower = query.lowercase(Locale.ROOT)
+
+        // 0. Strict J.A.R.V.I.S. Creator & Identity Guard (0 API tokens, exact required Hinglish persona)
+        if (matchesIdentityQuestion(lower)) {
+            return LocalRouteResult.Handled(
+                actionTag = "LOCAL:IDENTITY",
+                paramsJson = "{}",
+                reply = JARVIS_IDENTITY_REPLY
+            )
+        }
+
         val wantsEndCall = matchesEndCallIntent(lower)
         val relativeCall = parseRelativeCallDelay(query, lower, defaultCallPurpose)
 
@@ -128,9 +138,69 @@ class LocalCommandRouter(
             return LocalRouteResult.NotHandled
         }
 
+        // 4B. Universal Instant & Scheduled Social / App / Alarm / Media Automation (0 API tokens!)
+        TaskSchedulerAndAutomationManager.parseVoiceAutomationCommand(query)?.let { parsed ->
+            if (parsed.triggerAtMillis != null && parsed.taskType != TASK_TYPE_ALARM) {
+                val scheduledEntity = ScheduledTaskEntity(
+                    taskType = parsed.taskType,
+                    target = parsed.target,
+                    messageText = parsed.messageText,
+                    appPackage = parsed.appPackage,
+                    triggerAtMillis = parsed.triggerAtMillis,
+                    repeatDaily = parsed.repeatDaily,
+                    status = TASK_STATUS_PENDING
+                )
+                TaskSchedulerAndAutomationManager.scheduleTask(appContext, repository, scheduledEntity)
+                val friendlyAction = when (parsed.taskType) {
+                    TASK_TYPE_WHATSAPP_MSG -> "${parsed.target} ko WhatsApp message"
+                    TASK_TYPE_INSTAGRAM_DM -> "${parsed.target} ko Instagram DM"
+                    TASK_TYPE_SMS -> "${parsed.target} ko SMS"
+                    TASK_TYPE_INSTAGRAM_REELS -> "Instagram Reels"
+                    else -> parsed.target
+                }
+                return LocalRouteResult.Handled(
+                    actionTag = "LOCAL:SCHEDULE_${parsed.taskType}",
+                    paramsJson = JSONObject()
+                        .put("type", parsed.taskType)
+                        .put("target", parsed.target)
+                        .put("time", parsed.humanTimeLabel)
+                        .toString(),
+                    reply = "Done Boss, ${parsed.humanTimeLabel} par $friendlyAction automatically bhej dunga."
+                )
+            } else {
+                val immediateTask = ScheduledTaskEntity(
+                    taskType = parsed.taskType,
+                    target = parsed.target,
+                    messageText = parsed.messageText,
+                    appPackage = parsed.appPackage,
+                    triggerAtMillis = parsed.triggerAtMillis ?: System.currentTimeMillis(),
+                    status = TASK_STATUS_EXECUTED
+                )
+                val outcome = TaskSchedulerAndAutomationManager.executeTaskNow(appContext, immediateTask)
+                return LocalRouteResult.Handled(
+                    actionTag = "LOCAL:${parsed.taskType}",
+                    paramsJson = JSONObject()
+                        .put("target", parsed.target)
+                        .put("message", parsed.messageText)
+                        .toString(),
+                    reply = outcome
+                )
+            }
+        }
+
+        // 4C. Camera Photo / Video Capture
+        if (lower.contains("photo khich") || lower.contains("take a photo") || lower.contains("click photo") || lower.contains("selfie")) {
+            val outcome = TaskSchedulerAndAutomationManager.launchCameraCapture(appContext, isVideo = false)
+            return LocalRouteResult.Handled("LOCAL:CAMERA_PHOTO", "{}", outcome)
+        }
+        if (lower.contains("video record") || lower.contains("record video") || lower.contains("video banao")) {
+            val outcome = TaskSchedulerAndAutomationManager.launchCameraCapture(appContext, isVideo = true)
+            return LocalRouteResult.Handled("LOCAL:CAMERA_VIDEO", "{}", outcome)
+        }
+
         val a11y = JarvisAccessibilityService.instance
 
-        // 5. Instant Navigation & Hardware Controls (0 API Tokens!)
+        // 5. Instant Navigation & Full System Hardware Controls (0 API Tokens + 750ms post-action settle!)
         when {
             lower.contains("home screen") ||
                 lower.contains("home kholo") ||
@@ -138,7 +208,7 @@ class LocalCommandRouter(
                 lower.contains("home pe jao") ||
                 lower == "go home" ||
                 lower == "home" -> {
-                val ok = a11y?.performGlobalSystemAction("HOME") == true
+                val ok = a11y?.performGlobalSystemActionAndSettle("HOME") == true
                 return LocalRouteResult.Handled(
                     actionTag = "LOCAL:HOME",
                     paramsJson = "{}",
@@ -151,7 +221,7 @@ class LocalCommandRouter(
                 lower.contains("go back") ||
                 lower.contains("piche jao") ||
                 lower.contains("peeche jao") -> {
-                val ok = a11y?.performGlobalSystemAction("BACK") == true
+                val ok = a11y?.performGlobalSystemActionAndSettle("BACK") == true
                 return LocalRouteResult.Handled(
                     actionTag = "LOCAL:BACK",
                     paramsJson = "{}",
@@ -162,7 +232,7 @@ class LocalCommandRouter(
             lower.contains("recent apps") ||
                 lower.contains("recents") ||
                 lower.contains("recent kholo") -> {
-                val ok = a11y?.performGlobalSystemAction("RECENTS") == true
+                val ok = a11y?.performGlobalSystemActionAndSettle("RECENTS") == true
                 return LocalRouteResult.Handled(
                     actionTag = "LOCAL:RECENTS",
                     paramsJson = "{}",
@@ -170,11 +240,40 @@ class LocalCommandRouter(
                 )
             }
 
+            lower.contains("quick settings") || lower.contains("control center") -> {
+                val ok = a11y?.performGlobalSystemActionAndSettle("QUICK_SETTINGS") == true
+                return LocalRouteResult.Handled(
+                    actionTag = "LOCAL:QUICK_SETTINGS",
+                    paramsJson = "{}",
+                    reply = if (ok) "Quick Settings khol diya hai Sir." else "Accessibility Service enable kijiye Sir."
+                )
+            }
+
+            lower.contains("notification panel") || lower.contains("notifications kholo") || lower == "notifications" -> {
+                val ok = a11y?.performGlobalSystemActionAndSettle("NOTIFICATIONS") == true
+                return LocalRouteResult.Handled(
+                    actionTag = "LOCAL:NOTIFICATIONS",
+                    paramsJson = "{}",
+                    reply = if (ok) "Notification panel khol diya hai Sir." else "Accessibility Service enable kijiye Sir."
+                )
+            }
+
+            lower.contains("lock screen") || lower.contains("phone lock") || lower.contains("screen lock") -> {
+                val ok = a11y?.performGlobalSystemAction("LOCK_SCREEN") == true
+                return LocalRouteResult.Handled(
+                    actionTag = "LOCAL:LOCK_SCREEN",
+                    paramsJson = "{}",
+                    reply = if (ok) "Phone lock kar diya hai Sir." else "Accessibility Service enable kijiye Sir."
+                )
+            }
+
             lower.contains("scroll down") ||
+                lower.contains("scroll karo") ||
                 lower.contains("niche scroll") ||
                 lower.contains("neeche scroll") ||
                 lower.contains("niche karo") -> {
                 val ok = a11y?.scrollDown() == true
+                if (ok) a11y?.settleAndRefreshScreen()
                 return LocalRouteResult.Handled(
                     actionTag = "LOCAL:SCROLL_DOWN",
                     paramsJson = "{}",
@@ -186,6 +285,7 @@ class LocalCommandRouter(
                 lower.contains("upar scroll") ||
                 lower.contains("upar karo") -> {
                 val ok = a11y?.scrollUp() == true
+                if (ok) a11y?.settleAndRefreshScreen()
                 return LocalRouteResult.Handled(
                     actionTag = "LOCAL:SCROLL_UP",
                     paramsJson = "{}",
@@ -218,7 +318,12 @@ class LocalCommandRouter(
                 lower.contains("awaz badhao") ||
                 lower.contains("aawaz badhao") ||
                 lower.contains("volume badhao") -> {
-                offlineProcessor.adjustVolume(AudioManager.ADJUST_RAISE)
+                val stream = when {
+                    lower.contains("ring") -> AudioManager.STREAM_RING
+                    lower.contains("alarm") -> AudioManager.STREAM_ALARM
+                    else -> AudioManager.STREAM_MUSIC
+                }
+                offlineProcessor.adjustVolumeStream(stream, AudioManager.ADJUST_RAISE)
                 return LocalRouteResult.Handled(
                     actionTag = "LOCAL:VOLUME_UP",
                     paramsJson = "{}",
@@ -232,16 +337,78 @@ class LocalCommandRouter(
                 lower.contains("awaz kam") ||
                 lower.contains("aawaz kam") ||
                 lower.contains("volume kam") -> {
-                offlineProcessor.adjustVolume(AudioManager.ADJUST_LOWER)
+                val stream = when {
+                    lower.contains("ring") -> AudioManager.STREAM_RING
+                    lower.contains("alarm") -> AudioManager.STREAM_ALARM
+                    else -> AudioManager.STREAM_MUSIC
+                }
+                offlineProcessor.adjustVolumeStream(stream, AudioManager.ADJUST_LOWER)
                 return LocalRouteResult.Handled(
                     actionTag = "LOCAL:VOLUME_DOWN",
                     paramsJson = "{}",
                     reply = "Volume kam kar diya hai Sir."
                 )
             }
+
+            lower.contains("mobile data") || lower.contains("cellular data") -> {
+                return LocalRouteResult.Handled("LOCAL:MOBILE_DATA", "{}", offlineProcessor.openMobileDataSettings())
+            }
+
+            lower.contains("hotspot") && !lower.contains(" and ") && !lower.contains(" aur ") -> {
+                return LocalRouteResult.Handled("LOCAL:HOTSPOT", "{}", offlineProcessor.openHotspotSettings())
+            }
+
+            lower.contains("airplane mode") || lower.contains("flight mode") -> {
+                return LocalRouteResult.Handled("LOCAL:AIRPLANE_MODE", "{}", offlineProcessor.openAirplaneModeSettings())
+            }
+
+            lower.contains("battery saver") || lower.contains("power saver") -> {
+                return LocalRouteResult.Handled("LOCAL:BATTERY_SAVER", "{}", offlineProcessor.openBatterySaverSettings())
+            }
+
+            lower.contains("brightness") -> {
+                return LocalRouteResult.Handled("LOCAL:BRIGHTNESS", "{}", offlineProcessor.openDisplayBrightnessSettings())
+            }
+        }
+
+        // 5B. Hinglish single-app opener ("Instagram kholo", "WhatsApp khol do", "YouTube chalu karo")
+        val hindiOpenMatch = Regex(
+            "^([a-z0-9 ._-]+?)\\s+(?:kholo|khol\\s+do|open\\s+karo|chalu\\s+karo)$",
+            RegexOption.IGNORE_CASE
+        ).find(query)
+        if (hindiOpenMatch != null && !lower.contains(" aur ") && !lower.contains(" and ") && !lower.contains(" pe ")) {
+            val candidateApp = hindiOpenMatch.groupValues[1].trim()
+            val launched = offlineProcessor.openInstalledApp(candidateApp)
+            if (launched != null) {
+                a11y?.settleAndRefreshScreen()
+                return LocalRouteResult.Handled(
+                    actionTag = "LOCAL:OPEN_APP",
+                    paramsJson = JSONObject().put("appName", launched).toString(),
+                    reply = "$launched khol diya hai Sir."
+                )
+            }
         }
 
         return LocalRouteResult.NotHandled
+    }
+
+    fun matchesIdentityQuestion(lower: String): Boolean {
+        return lower.contains("tum kaun ho") ||
+            lower.contains("aap kaun ho") ||
+            lower.contains("kaun ho tum") ||
+            lower.contains("who are you") ||
+            lower.contains("tumhe kisne banaya") ||
+            lower.contains("tumko kisne banaya") ||
+            lower.contains("kisne banaya") ||
+            lower.contains("who made you") ||
+            lower.contains("who created you") ||
+            lower.contains("who developed you") ||
+            lower.contains("kya tum gemini") ||
+            lower.contains("are you gemini") ||
+            lower.contains("kaunsa model") ||
+            lower.contains("kaun sa model") ||
+            lower.contains("which model are you") ||
+            lower.contains("what model are you")
     }
 
     fun isShortOrNoise(raw: String): Boolean {

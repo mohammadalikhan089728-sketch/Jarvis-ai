@@ -270,6 +270,109 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Mandatory 750ms post-action settle + fresh multi-window hierarchy capture
+     * across ALL interactive windows (service.windows + rootInActiveWindow) to eliminate
+     * post-Home and post-app-launch touch freezes.
+     */
+    suspend fun settleAndRefreshScreen(delayMs: Long = POST_ACTION_SETTLE_DELAY_MS): ScreenHierarchySnapshot? {
+        kotlinx.coroutines.delay(delayMs)
+        runCatching { rootInActiveWindow?.refresh() }
+        runCatching { windows.forEach { win -> win.root?.refresh() } }
+        return readScreenHierarchy()
+    }
+
+    suspend fun tapRelativeScreenPoint(xFraction: Float, yFraction: Float): Boolean {
+        val bounds = gestureEngine.getScreenBounds()
+        val x = (bounds.widthPx * xFraction.coerceIn(0.02f, 0.98f))
+        val y = (bounds.heightPx * yFraction.coerceIn(0.02f, 0.98f))
+        return tapXY(x, y, durationMs = 80L)
+    }
+
+    suspend fun tapByViewId(viewIdSubstring: String): Boolean {
+        val needle = viewIdSubstring.trim().lowercase()
+        if (needle.isEmpty()) return false
+        val roots = collectInteractiveRoots()
+        for (root in roots) {
+            val matched = findNodeByViewId(root, needle) ?: continue
+            if (clickOrDispatchFallback(matched)) return true
+        }
+        return false
+    }
+
+    suspend fun tapSendButtonOnScreen(): Boolean {
+        val sendIds = listOf(
+            "send",
+            "row_thread_composer_button_send",
+            "send_message_button_icon",
+            "send_button",
+            "button_send"
+        )
+        for (id in sendIds) {
+            if (tapByViewId(id)) return true
+        }
+        val sendLabels = listOf("Send", "Send message", "Send SMS")
+        for (label in sendLabels) {
+            if (tapByText(label)) return true
+        }
+        // Final coordinate fallback: bottom-right send icon above IME / composer bar
+        return tapRelativeScreenPoint(0.92f, 0.56f) || tapRelativeScreenPoint(0.92f, 0.92f)
+    }
+
+    suspend fun tapFirstContactResultRow(): Boolean {
+        val snapshot = readScreenHierarchy(maxNodes = 40) ?: return false
+        val candidate = snapshot.nodes.firstOrNull { node ->
+            node.centerY in (snapshot.screenHeight * 0.16f).toInt()..(snapshot.screenHeight * 0.55f).toInt() &&
+                (node.clickable || node.text.isNotBlank()) &&
+                !node.editable
+        }
+        return if (candidate != null) {
+            tapXY(candidate.centerX.toFloat(), candidate.centerY.toFloat())
+        } else {
+            tapRelativeScreenPoint(0.45f, 0.27f)
+        }
+    }
+
+    private suspend fun clickOrDispatchFallback(node: AccessibilityNodeInfo): Boolean {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        val hasBounds = rect.width() > 0 && rect.height() > 0
+        var clickableNode: AccessibilityNodeInfo? = node
+        var hops = 0
+        while (clickableNode != null && !clickableNode.isClickable && hops < 6) {
+            clickableNode = clickableNode.parent
+            hops++
+        }
+        if (clickableNode != null && clickableNode.isClickable) {
+            if (clickableNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                return true
+            }
+        }
+        if (hasBounds) {
+            return tapXY(rect.centerX().toFloat(), rect.centerY().toFloat())
+        }
+        return false
+    }
+
+    private fun findNodeByViewId(root: AccessibilityNodeInfo, needleLower: String): AccessibilityNodeInfo? {
+        var found: AccessibilityNodeInfo? = null
+        fun search(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > 26 || found != null) return
+            if (!node.isVisibleToUser) return
+            val id = node.viewIdResourceName?.lowercase().orEmpty()
+            if (id.isNotEmpty() && id.contains(needleLower)) {
+                found = node
+                return
+            }
+            for (i in 0 until node.childCount) {
+                search(node.getChild(i), depth + 1)
+                if (found != null) return
+            }
+        }
+        search(root, 0)
+        return found
+    }
+
+    /**
      * Physical finger tap gesture using Path.moveTo(x, y) (80ms duration) via dispatchGesture
      * awaited cleanly with CompletableDeferred so multi-step automation waits until touch finishes.
      */
@@ -435,9 +538,14 @@ class JarvisAccessibilityService : AccessibilityService() {
         }
         var entered = editableNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
 
+        // Verify text took effect; if not (e.g., Compose/Instagram/WebView inputs), fall back to clipboard paste
         if (!entered) {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("jarvis_input", text))
+            if (rect.width() > 0 && rect.height() > 0) {
+                tapXY(rect.centerX().toFloat(), rect.centerY().toFloat())
+            }
+            editableNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             entered = editableNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
         }
 
@@ -457,6 +565,14 @@ class JarvisAccessibilityService : AccessibilityService() {
             }
         }
         return entered
+    }
+
+    suspend fun performGlobalSystemActionAndSettle(actionName: String): Boolean {
+        val ok = performGlobalSystemAction(actionName)
+        if (ok) {
+            settleAndRefreshScreen(POST_ACTION_SETTLE_DELAY_MS)
+        }
+        return ok
     }
 
     fun performGlobalSystemAction(actionName: String): Boolean {
@@ -565,6 +681,8 @@ class JarvisAccessibilityService : AccessibilityService() {
     }
 
     companion object {
+        const val POST_ACTION_SETTLE_DELAY_MS = 750L
+
         @Volatile
         var instance: JarvisAccessibilityService? = null
             private set

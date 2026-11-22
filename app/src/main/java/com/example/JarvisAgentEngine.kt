@@ -165,11 +165,57 @@ class JarvisAgentEngine(
             return res
         }
 
-        // 8. Ultra-Fast Streaming Conversational Q&A (~400ms first-sentence TTS) when no phone UI action is needed
+        // 8. Pure Conversational Q&A:
+        //    - When "With AI Voice" is active, route directly through the ONE persistent Live Audio WebSocket
+        //      (zero REST generateContent loop, zero screen JSON, instant deep male audio + clean transcript).
+        //    - Otherwise (or if Live Audio is unavailable/in cooldown), use ultra-fast streaming TTS.
         if (isPureConversationalQuery(normalizedLower)) {
             onPhaseUpdate(JarvisPhase.THINKING)
-            val recentHistory = repository.getRecentHistory(limit = 4)
             val memoryContext = memoryManager.buildCompactMemoryContext(query)
+
+            if (settings.voiceMode == VOICE_MODE_AI_VOICE && !PersistentLiveAudioSession.isInQuotaCooldown()) {
+                onPhaseUpdate(JarvisPhase.SPEAKING)
+                val liveResult = PersistentLiveAudioSession.sendConversationalTurn(
+                    rawApiKey = settings.geminiApiKey,
+                    userText = query,
+                    voiceName = settings.aiVoiceName.ifBlank { AI_VOICE_CHARON },
+                    masterSystemPrompt = settings.masterSystemPrompt,
+                    memoryContext = memoryContext
+                )
+                if (liveResult.isSuccess) {
+                    val turn = liveResult.getOrThrow()
+                    val cleanTranscript = JarvisResponseSanitizer.extractCleanReply(turn.spokenTranscript)
+                        .ifBlank { "Ji Sir, jawab de diya hai." }
+                    val elapsed = System.currentTimeMillis() - startMs
+                    val res = AgentExecutionResult(
+                        executedAction = "JARVIS:LIVE_AUDIO",
+                        paramsJson = JSONObject().put("chunks", turn.pcmChunksPlayed).toString(),
+                        reply = cleanTranscript,
+                        isOffline = false,
+                        latencyMs = elapsed,
+                        alreadyStreamSpoken = true
+                    )
+                    logAndReturn(query, res)
+                    return res
+                }
+                // If quota cooldown was triggered during Live Audio attempt, never spam REST retries
+                if (PersistentLiveAudioSession.isInQuotaCooldown()) {
+                    val elapsed = System.currentTimeMillis() - startMs
+                    val res = AgentExecutionResult(
+                        executedAction = "JARVIS:QUOTA_COOLDOWN",
+                        paramsJson = "{}",
+                        reply = "Rate limit cooldown active hai Sir (${PersistentLiveAudioSession.remainingCooldownSeconds()}s). Offline commands aur device controls abhi bhi kaam kar rahe hain.",
+                        isOffline = true,
+                        latencyMs = elapsed,
+                        alreadyStreamSpoken = false
+                    )
+                    logAndReturn(query, res)
+                    return res
+                }
+                onPhaseUpdate(JarvisPhase.THINKING)
+            }
+
+            val recentHistory = repository.getRecentHistory(limit = 4)
             var startedSpeaking = false
             val streamResult = aiClient.streamConversationalReply(
                 rawApiKey = settings.geminiApiKey,
@@ -402,19 +448,21 @@ class JarvisAgentEngine(
                     break
                 }
 
-                if (step == 1 && !looksLikeMultiStepGoal(goalQuery)) {
-                    if (execNote != null) {
-                        finalReply = "${aiAction.reply} ($execNote)"
-                    }
-                    break
-                }
-
+                // Mandatory post-action 750ms UI settle + fresh interactive window refresh so touches NEVER freeze after Home/app switch
                 val settleTickMs = 100L
                 var waited = 0L
                 while (waited < STEP_SETTLE_DELAY_MS) {
                     if (JarvisAccessibilityService.isStopRequested()) break
                     delay(settleTickMs)
                     waited += settleTickMs
+                }
+                JarvisAccessibilityService.instance?.settleAndRefreshScreen(delayMs = 0L)
+
+                if (step == 1 && !looksLikeMultiStepGoal(goalQuery)) {
+                    if (execNote != null) {
+                        finalReply = "${aiAction.reply} ($execNote)"
+                    }
+                    break
                 }
             }
         } finally {
@@ -876,7 +924,7 @@ class JarvisAgentEngine(
                 if (!service.tapXY(x, y, durationMs = 80L)) "Tap gesture cancelled" else null
             }
 
-            "LONG_PRESS" -> {
+            "LONG_PRESS", "LONG_PRESS_XY" -> {
                 if (service == null) return "Accessibility Service inactive"
                 val x = params.optDouble("x", -1.0).toFloat()
                 val y = params.optDouble("y", -1.0).toFloat()
@@ -913,17 +961,17 @@ class JarvisAgentEngine(
 
             "BACK" -> {
                 if (service == null) return "Accessibility Service inactive"
-                if (!service.performGlobalSystemAction("BACK")) "Back action failed" else null
+                if (!service.performGlobalSystemActionAndSettle("BACK")) "Back action failed" else null
             }
 
             "HOME" -> {
                 if (service == null) return "Accessibility Service inactive"
-                if (!service.performGlobalSystemAction("HOME")) "Home action failed" else null
+                if (!service.performGlobalSystemActionAndSettle("HOME")) "Home action failed" else null
             }
 
             "RECENTS" -> {
                 if (service == null) return "Accessibility Service inactive"
-                if (!service.performGlobalSystemAction("RECENTS")) "Recents action failed" else null
+                if (!service.performGlobalSystemActionAndSettle("RECENTS")) "Recents action failed" else null
             }
 
             "DRAG" -> {
@@ -1011,6 +1059,26 @@ class JarvisAgentEngine(
                         offlineProcessor.openBluetoothSettings()
                         null
                     }
+                    "MOBILE_DATA" -> {
+                        offlineProcessor.openMobileDataSettings()
+                        null
+                    }
+                    "HOTSPOT" -> {
+                        offlineProcessor.openHotspotSettings()
+                        null
+                    }
+                    "AIRPLANE_MODE" -> {
+                        offlineProcessor.openAirplaneModeSettings()
+                        null
+                    }
+                    "BATTERY_SAVER" -> {
+                        offlineProcessor.openBatterySaverSettings()
+                        null
+                    }
+                    "BRIGHTNESS" -> {
+                        offlineProcessor.openDisplayBrightnessSettings()
+                        null
+                    }
                     "DND" -> {
                         offlineProcessor.toggleDoNotDisturb(null)
                         null
@@ -1030,7 +1098,7 @@ class JarvisAgentEngine(
                     }
                     else -> {
                         if (service == null) "Accessibility Service inactive"
-                        else if (!service.performGlobalSystemAction(cmd)) "Global action $cmd unsupported" else null
+                        else if (!service.performGlobalSystemActionAndSettle(cmd)) "Global action $cmd unsupported" else null
                     }
                 }
             }
@@ -1040,7 +1108,7 @@ class JarvisAgentEngine(
     }
 
     companion object {
-        const val MAX_AGENT_STEPS = 8
-        const val STEP_SETTLE_DELAY_MS = 900L
+        const val MAX_AGENT_STEPS = 12
+        const val STEP_SETTLE_DELAY_MS = 750L
     }
 }

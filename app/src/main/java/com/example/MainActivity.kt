@@ -1,6 +1,8 @@
 package com.example
 
 import android.Manifest
+import android.app.KeyguardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -96,6 +98,13 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                    WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD
+            )
         }
 
         handleLaunchIntent(intent)
@@ -134,6 +143,18 @@ class MainActivity : ComponentActivity() {
 
     private fun handleLaunchIntent(launchIntent: Intent?) {
         if (launchIntent == null) return
+
+        // Wake screen and request keyguard dismissal when launched by a scheduled automation task or wake word over lock screen
+        val wakeForTask = launchIntent.getBooleanExtra(TaskSchedulerAndAutomationManager.EXTRA_WAKE_FOR_TASK, false) ||
+            launchIntent.getBooleanExtra(JarvisWakeWordService.EXTRA_WAKE_TRIGGERED, false)
+        if (wakeForTask) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                runCatching { km?.requestDismissKeyguard(this, null) }
+            }
+        }
+
         val action = launchIntent.action
         val initialCommand = launchIntent.getStringExtra(JarvisWakeWordService.EXTRA_INITIAL_COMMAND)?.trim().orEmpty()
         val shouldStartListening =
@@ -178,6 +199,7 @@ private fun JarvisRootApp(
     val history by viewModel.chatHistory.collectAsStateWithLifecycle()
     val macros by viewModel.macros.collectAsStateWithLifecycle()
     val scheduledCalls by viewModel.scheduledCalls.collectAsStateWithLifecycle()
+    val scheduledTasks by viewModel.scheduledTasks.collectAsStateWithLifecycle()
     val userMemories by viewModel.userMemories.collectAsStateWithLifecycle()
     val permissions by viewModel.permissionsState.collectAsStateWithLifecycle()
     val keyVerification by viewModel.keyVerificationState.collectAsStateWithLifecycle()
@@ -476,6 +498,7 @@ private fun JarvisRootApp(
                                 notificationListenerGranted = permissions.notificationListenerActive,
                                 wakeWordServiceRunning = wakeWordServiceRunning,
                                 scheduledCalls = scheduledCalls,
+                                scheduledTasks = scheduledTasks,
                                 userMemories = userMemories,
                                 onSaveSettings = viewModel::saveSettings,
                                 onVerifyApiKey = viewModel::verifyAiCoreApiKey,
@@ -488,6 +511,9 @@ private fun JarvisRootApp(
                                 onAddScheduledCall = viewModel::addScheduledCall,
                                 onToggleScheduledCall = viewModel::toggleScheduledCallEnabled,
                                 onDeleteScheduledCall = viewModel::deleteScheduledCall,
+                                onAddScheduledTask = viewModel::addScheduledAutomationTask,
+                                onDeleteScheduledTask = viewModel::deleteScheduledAutomationTask,
+                                onRunScheduledTaskNow = viewModel::runScheduledTaskNow,
                                 onAddUserMemory = viewModel::addUserMemory,
                                 onDeleteUserMemory = viewModel::deleteUserMemory,
                                 onTestIncomingCall = viewModel::triggerTestIncomingCall,

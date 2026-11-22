@@ -31,9 +31,11 @@ import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PhoneInTalk
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.ScheduleSend
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Tune
@@ -113,6 +115,7 @@ fun SettingsScreen(
     notificationListenerGranted: Boolean,
     wakeWordServiceRunning: Boolean,
     scheduledCalls: List<ScheduledCallEntity>,
+    scheduledTasks: List<ScheduledTaskEntity>,
     userMemories: List<UserMemoryEntity>,
     onSaveSettings: (SettingsEntity) -> Unit,
     onVerifyApiKey: (String) -> Unit,
@@ -125,6 +128,9 @@ fun SettingsScreen(
     onAddScheduledCall: (hour: Int, minute: Int, purpose: String, actionType: String, repeatDaysCsv: String) -> Unit,
     onToggleScheduledCall: (ScheduledCallEntity, Boolean) -> Unit,
     onDeleteScheduledCall: (ScheduledCallEntity) -> Unit,
+    onAddScheduledTask: (taskType: String, target: String, messageText: String, hour: Int, minute: Int, repeatDaily: Boolean) -> Unit,
+    onDeleteScheduledTask: (ScheduledTaskEntity) -> Unit,
+    onRunScheduledTaskNow: (ScheduledTaskEntity) -> Unit,
     onAddUserMemory: (factText: String, category: String) -> Unit,
     onDeleteUserMemory: (UserMemoryEntity) -> Unit,
     onTestIncomingCall: () -> Unit,
@@ -161,6 +167,7 @@ fun SettingsScreen(
     var autoReplyTargetContact by rememberSaveable { mutableStateOf(settings.autoReplyTargetContact) }
     var savedBanner by remember { mutableStateOf<String?>(null) }
     var showScheduleDialog by remember { mutableStateOf(false) }
+    var showScheduleTaskDialog by remember { mutableStateOf(false) }
     var showAddMemoryDialog by remember { mutableStateOf(false) }
 
     // Synchronize local form fields when Room emits saved updates
@@ -225,6 +232,18 @@ fun SettingsScreen(
                 onAddUserMemory(fact, category)
                 showAddMemoryDialog = false
                 savedBanner = "Memory stored permanently in local Room Vault."
+            }
+        )
+    }
+
+    if (showScheduleTaskDialog) {
+        AddScheduledTaskDialog(
+            onDismiss = { showScheduleTaskDialog = false },
+            onConfirm = { taskType, target, messageText, hour, minute, repeatDaily ->
+                onRequestPostNotificationsPermission()
+                onAddScheduledTask(taskType, target, messageText, hour, minute, repeatDaily)
+                showScheduleTaskDialog = false
+                savedBanner = "Scheduled automation task for ${CallAlarmScheduler.formatTime12Hour(hour, minute)}."
             }
         )
     }
@@ -435,10 +454,10 @@ fun SettingsScreen(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 VoiceOptionRow(
-                    title = "With AI Voice",
-                    subtitle = "Ultra-realistic live neural male voice • Auto-falls back to Normal Voice when offline",
-                    badgeText = "HIGH TOKEN USAGE",
-                    badgeColor = StarkAmber,
+                    title = "With AI Voice (Single Persistent Live Session)",
+                    subtitle = "ONE live audio link (Charon / Orus deep male Hindi/Hinglish voice) • Zero per-turn REST loop • Auto-cooldown & offline fallback",
+                    badgeText = "LIVE AUDIO",
+                    badgeColor = ArcCyan,
                     selected = voiceMode == VOICE_MODE_AI_VOICE,
                     onSelect = {
                         voiceMode = VOICE_MODE_AI_VOICE
@@ -465,7 +484,7 @@ fun SettingsScreen(
                                 aiVoiceName = AI_VOICE_CHARON
                                 onSaveSettings(buildCurrentEntity())
                             },
-                            label = { Text("Charon (Deep)") },
+                            label = { Text("Charon") },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = ArcCyan.copy(alpha = 0.22f),
                                 selectedLabelColor = ArcCyan
@@ -475,12 +494,27 @@ fun SettingsScreen(
                                 .testTag("ai_voice_charon_chip")
                         )
                         FilterChip(
+                            selected = aiVoiceName == AI_VOICE_ORUS,
+                            onClick = {
+                                aiVoiceName = AI_VOICE_ORUS
+                                onSaveSettings(buildCurrentEntity())
+                            },
+                            label = { Text("Orus") },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = ArcCyan.copy(alpha = 0.22f),
+                                selectedLabelColor = ArcCyan
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("ai_voice_orus_chip")
+                        )
+                        FilterChip(
                             selected = aiVoiceName == AI_VOICE_FENRIR,
                             onClick = {
                                 aiVoiceName = AI_VOICE_FENRIR
                                 onSaveSettings(buildCurrentEntity())
                             },
-                            label = { Text("Fenrir (Crisp)") },
+                            label = { Text("Fenrir") },
                             colors = FilterChipDefaults.filterChipColors(
                                 selectedContainerColor = ArcCyan.copy(alpha = 0.22f),
                                 selectedLabelColor = ArcCyan
@@ -657,6 +691,60 @@ fun SettingsScreen(
                                 call = call,
                                 onToggle = { enabled -> onToggleScheduledCall(call, enabled) },
                                 onDelete = { onDeleteScheduledCall(call) }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 4A. Scheduled Autonomous Tasks (WhatsApp, Instagram DM, SMS, Direct Calls, Alarms)
+            SettingsSectionCard(
+                title = "SCHEDULED AUTOMATION TASKS (${scheduledTasks.size})",
+                icon = Icons.Filled.ScheduleSend
+            ) {
+                Text(
+                    text = "Automate WhatsApp messages, Instagram DMs, SMS, calls, or alarms at exact times using AlarmManager + WorkManager + Lock-Screen Wake. Or command by voice: \"Shaam 6 baje Rahul ko WhatsApp par Hello bhej dena\".",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = { showScheduleTaskDialog = true },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ArcCyan,
+                        contentColor = ObsidianVoid
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("add_scheduled_task_button")
+                ) {
+                    Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("ADD AUTOMATION TASK")
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+
+                if (scheduledTasks.isEmpty()) {
+                    Surface(
+                        shape = MaterialTheme.shapes.medium,
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.6f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "No scheduled automation tasks yet. Tap ADD AUTOMATION TASK or schedule by voice.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        scheduledTasks.take(20).forEach { task ->
+                            ScheduledTaskRowCard(
+                                task = task,
+                                onRunNow = { onRunScheduledTaskNow(task) },
+                                onDelete = { onDeleteScheduledTask(task) }
                             )
                         }
                     }
@@ -1591,6 +1679,234 @@ private fun VerificationBanner(
             )
         }
     }
+}
+
+@Composable
+private fun ScheduledTaskRowCard(
+    task: ScheduledTaskEntity,
+    onRunNow: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val statusColor = when (task.status) {
+        TASK_STATUS_EXECUTED -> SignalGreen
+        TASK_STATUS_FAILED -> SignalCrimson
+        else -> ArcCyan
+    }
+    val timeLabel = remember(task.triggerAtMillis) {
+        java.text.SimpleDateFormat("dd MMM, h:mm a", Locale.getDefault())
+            .format(java.util.Date(task.triggerAtMillis))
+    }
+
+    Surface(
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.45f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("scheduled_task_row_${task.id}")
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = statusColor.copy(alpha = 0.16f),
+                        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.55f))
+                    ) {
+                        Text(
+                            text = task.status,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = statusColor,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                    Text(
+                        text = task.taskType.replace('_', ' '),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = ArcCyan
+                    )
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = if (task.messageText.isNotBlank()) {
+                        "${task.target} • \"${task.messageText}\""
+                    } else {
+                        task.target
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "$timeLabel${if (task.repeatDaily) " • Daily" else " • Once"}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            IconButton(
+                onClick = onRunNow,
+                modifier = Modifier.testTag("run_scheduled_task_${task.id}")
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.PlayArrow,
+                    contentDescription = "Run automation task now",
+                    tint = SignalGreen
+                )
+            }
+            IconButton(
+                onClick = onDelete,
+                modifier = Modifier.testTag("delete_scheduled_task_${task.id}")
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Delete,
+                    contentDescription = "Delete scheduled task",
+                    tint = SignalCrimson
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+private fun AddScheduledTaskDialog(
+    onDismiss: () -> Unit,
+    onConfirm: (taskType: String, target: String, messageText: String, hour: Int, minute: Int, repeatDaily: Boolean) -> Unit
+) {
+    val nowCal = remember { Calendar.getInstance().apply { add(Calendar.MINUTE, 5) } }
+    val timeState = rememberTimePickerState(
+        initialHour = nowCal.get(Calendar.HOUR_OF_DAY),
+        initialMinute = nowCal.get(Calendar.MINUTE),
+        is24Hour = false
+    )
+    var selectedType by remember { mutableStateOf(TASK_TYPE_WHATSAPP_MSG) }
+    var target by remember { mutableStateOf("") }
+    var messageText by remember { mutableStateOf("") }
+    var repeatDaily by remember { mutableStateOf(false) }
+
+    val typeOptions = listOf(
+        TASK_TYPE_WHATSAPP_MSG to "WhatsApp",
+        TASK_TYPE_INSTAGRAM_DM to "Insta DM",
+        TASK_TYPE_PHONE_CALL to "Phone Call",
+        TASK_TYPE_SMS to "SMS",
+        TASK_TYPE_ALARM to "Alarm",
+        TASK_TYPE_OPEN_APP to "Open App"
+    )
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        title = {
+            Text(
+                text = "SCHEDULE AUTOMATION TASK",
+                style = MaterialTheme.typography.titleMedium,
+                color = ArcCyan
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    typeOptions.forEach { (key, label) ->
+                        FilterChip(
+                            selected = selectedType == key,
+                            onClick = { selectedType = key },
+                            label = { Text(label) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = ArcCyan.copy(alpha = 0.22f),
+                                selectedLabelColor = ArcCyan
+                            )
+                        )
+                    }
+                }
+
+                TimeInput(state = timeState)
+
+                OutlinedTextField(
+                    value = target,
+                    onValueChange = { target = it },
+                    label = {
+                        Text(
+                            when (selectedType) {
+                                TASK_TYPE_OPEN_APP -> "App Name (e.g., YouTube, Spotify)"
+                                TASK_TYPE_ALARM -> "Alarm Label"
+                                else -> "Contact Name / Phone / Handle"
+                            }
+                        )
+                    },
+                    singleLine = true,
+                    colors = hudTextFieldColors(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("scheduled_task_target_input")
+                )
+
+                if (selectedType == TASK_TYPE_WHATSAPP_MSG ||
+                    selectedType == TASK_TYPE_INSTAGRAM_DM ||
+                    selectedType == TASK_TYPE_SMS
+                ) {
+                    OutlinedTextField(
+                        value = messageText,
+                        onValueChange = { messageText = it },
+                        label = { Text("Message Text") },
+                        minLines = 2,
+                        maxLines = 4,
+                        colors = hudTextFieldColors(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("scheduled_task_message_input")
+                    )
+                }
+
+                BehaviorToggleRow(
+                    title = "Repeat Daily",
+                    subtitle = "Re-arm automatically every 24 hours after execution",
+                    checked = repeatDaily,
+                    onCheckedChange = { repeatDaily = it },
+                    tag = "scheduled_task_repeat_daily_toggle"
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val effectiveTarget = target.trim().ifBlank {
+                        if (selectedType == TASK_TYPE_ALARM) "J.A.R.V.I.S. Alarm" else ""
+                    }
+                    if (effectiveTarget.isNotEmpty()) {
+                        onConfirm(
+                            selectedType,
+                            effectiveTarget,
+                            messageText.trim(),
+                            timeState.hour,
+                            timeState.minute,
+                            repeatDaily
+                        )
+                    }
+                },
+                enabled = target.trim().isNotEmpty() || selectedType == TASK_TYPE_ALARM,
+                modifier = Modifier.testTag("confirm_add_scheduled_task_button")
+            ) {
+                Text("SCHEDULE")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("CANCEL")
+            }
+        }
+    )
 }
 
 @Composable

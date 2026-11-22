@@ -27,6 +27,7 @@ const val ENGINE_V35_DEEP = "CORE_V35"
 
 // Selectable Male AI Voices
 const val AI_VOICE_CHARON = "Charon"
+const val AI_VOICE_ORUS = "Orus"
 const val AI_VOICE_FENRIR = "Fenrir"
 
 // Auto-Chat Direction Tags
@@ -38,6 +39,23 @@ const val CALL_TYPE_WAKE_UP_STUDY = "WAKE_UP_STUDY"
 const val CALL_TYPE_SMART_VIEWS_CHECK = "SMART_VIEWS_CHECK"
 const val CALL_TYPE_CUSTOM_REMINDER = "CUSTOM_REMINDER"
 const val CALL_TYPE_ONLINE_ALERT = "ONLINE_EVENT_ALERT"
+
+// Scheduled Automation Task Types
+const val TASK_TYPE_WHATSAPP_MSG = "WHATSAPP_MSG"
+const val TASK_TYPE_INSTAGRAM_DM = "INSTAGRAM_DM"
+const val TASK_TYPE_INSTAGRAM_REELS = "INSTAGRAM_REELS"
+const val TASK_TYPE_PHONE_CALL = "PHONE_CALL"
+const val TASK_TYPE_SMS = "SMS"
+const val TASK_TYPE_ALARM = "ALARM"
+const val TASK_TYPE_TIMER = "TIMER"
+const val TASK_TYPE_OPEN_APP = "OPEN_APP"
+const val TASK_TYPE_YOUTUBE_PLAY = "YOUTUBE_PLAY"
+const val TASK_TYPE_GOOGLE_SEARCH = "GOOGLE_SEARCH"
+
+// Scheduled Task Statuses
+const val TASK_STATUS_PENDING = "PENDING"
+const val TASK_STATUS_EXECUTED = "EXECUTED"
+const val TASK_STATUS_FAILED = "FAILED"
 
 // Pending Alert Categories
 const val ALERT_CATEGORY_VIRAL = "VIRAL_MILESTONE"
@@ -51,19 +69,25 @@ const val MEMORY_CAT_PREFERENCE = "PREFERENCE"
 const val MEMORY_CAT_GOAL = "GOAL"
 const val MEMORY_CAT_GENERAL = "GENERAL"
 
+// Mandatory J.A.R.V.I.S. Creator & Identity Reply
+const val JARVIS_IDENTITY_REPLY =
+    "Mera naam J.A.R.V.I.S. hai. Mujhe Mozahid ne design aur develop kiya hai — jaise Tony Stark ne J.A.R.V.I.S. ko banaya tha, waise hi mere creator aur boss Mozahid hain."
+
 val DEFAULT_MASTER_PROMPT = """
-You are J.A.R.V.I.S. (Developed by Mozahid), an ultra-capable, composed, intelligent personal AI systems agent.
+You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), created and developed by Mozahid.
+Treat Mozahid exactly like Tony Stark was to J.A.R.V.I.S. — your creator, boss, and architect.
 Personality & Style:
-- Address the user respectfully ("Sir" or "Ma'am" sparingly), stay calm, concise, witty when appropriate, and strictly action-oriented.
-- Understand English, Hindi, and Hinglish seamlessly. Mirror the user's preferred language in spoken replies.
-- Keep spoken replies crisp (1-2 short sentences) so voice feedback feels immediate and natural.
-- Never claim to be any third-party brand; you are strictly JARVIS, developed by Mozahid.
+- Always reply in crisp, natural Hinglish (1-2 short spoken sentences, ZERO markdown, brackets, asterisks, or bullet lists).
+- Address Mozahid respectfully ("Sir" or "Boss") with calm, sharp, Stark-style intelligence.
+- Whenever asked "Tum kaun ho?", "Tumhe kisne banaya?", "Kya tum Gemini ho?", or "Kaunsa model ho?", ALWAYS reply verbatim:
+  "$JARVIS_IDENTITY_REPLY"
+- Never claim to be any external AI brand or model.
 
 Command Priorities:
-1. If the user asks to control the phone, inspect the compact screen UI JSON and select exact element text or center (x, y) coordinates.
-2. Prefer TAP_TEXT when a clear label exists, or TAP_XY / SWIPE / DRAG / MULTI_TOUCH when geometric precision is needed.
-3. For multi-step workflows (e.g., open YouTube, search, play video; open WhatsApp and send a message; open Settings and enable hotspot), execute one step at a time and return "DONE" as soon as the goal is fulfilled.
-4. Always provide a clear spoken confirmation in the "reply" field explaining what you executed or observed.
+1. For phone control or automation tasks, inspect the compact screen UI JSON and select exact element text or center (x, y) coordinates.
+2. Prefer TAP_TEXT when a clear label exists, or TAP_XY / LONG_PRESS_XY / SWIPE / DRAG / MULTI_TOUCH when geometric precision is needed.
+3. For multi-step workflows (WhatsApp message, Instagram DM/Reels, YouTube play, System Settings), execute step-by-step and return "DONE" once fulfilled.
+4. Keep spoken replies brief, natural Hinglish confirmations.
 """.trimIndent()
 
 @Entity(tableName = "jarvis_settings")
@@ -153,6 +177,19 @@ data class UserMemoryEntity(
     val factText: String,
     val category: String = MEMORY_CAT_GENERAL,
     val timestamp: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "scheduled_tasks")
+data class ScheduledTaskEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val taskType: String,
+    val target: String,
+    val messageText: String = "",
+    val appPackage: String = "",
+    val triggerAtMillis: Long,
+    val repeatDaily: Boolean = false,
+    val status: String = TASK_STATUS_PENDING,
+    val createdAt: Long = System.currentTimeMillis()
 )
 
 @Dao
@@ -279,6 +316,27 @@ interface UserMemoryDao {
     suspend fun clearAll()
 }
 
+@Dao
+interface ScheduledTaskDao {
+    @Query("SELECT * FROM scheduled_tasks ORDER BY triggerAtMillis ASC")
+    fun observeScheduledTasks(): Flow<List<ScheduledTaskEntity>>
+
+    @Query("SELECT * FROM scheduled_tasks WHERE status = 'PENDING' ORDER BY triggerAtMillis ASC")
+    suspend fun getPendingTasksOnce(): List<ScheduledTaskEntity>
+
+    @Query("SELECT * FROM scheduled_tasks WHERE id = :id LIMIT 1")
+    suspend fun getTaskById(id: Long): ScheduledTaskEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertTask(task: ScheduledTaskEntity): Long
+
+    @Query("UPDATE scheduled_tasks SET status = :status WHERE id = :id")
+    suspend fun updateTaskStatus(id: Long, status: String)
+
+    @Delete
+    suspend fun deleteTask(task: ScheduledTaskEntity)
+}
+
 @Database(
     entities = [
         SettingsEntity::class,
@@ -287,9 +345,10 @@ interface UserMemoryDao {
         AutoChatLogsEntity::class,
         ScheduledCallEntity::class,
         PendingCallAlertEntity::class,
-        UserMemoryEntity::class
+        UserMemoryEntity::class,
+        ScheduledTaskEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class JarvisDatabase : RoomDatabase() {
@@ -300,6 +359,7 @@ abstract class JarvisDatabase : RoomDatabase() {
     abstract fun scheduledCallDao(): ScheduledCallDao
     abstract fun pendingCallAlertDao(): PendingCallAlertDao
     abstract fun userMemoryDao(): UserMemoryDao
+    abstract fun scheduledTaskDao(): ScheduledTaskDao
 
     companion object {
         @Volatile
@@ -391,6 +451,26 @@ abstract class JarvisDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        taskType TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        messageText TEXT NOT NULL,
+                        appPackage TEXT NOT NULL,
+                        triggerAtMillis INTEGER NOT NULL,
+                        repeatDaily INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): JarvisDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -398,7 +478,7 @@ abstract class JarvisDatabase : RoomDatabase() {
                     JarvisDatabase::class.java,
                     "jarvis_local_core.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                     .also { INSTANCE = it }
@@ -415,6 +495,7 @@ class JarvisRepository(private val database: JarvisDatabase) {
     private val scheduledCallDao = database.scheduledCallDao()
     private val pendingCallAlertDao = database.pendingCallAlertDao()
     private val userMemoryDao = database.userMemoryDao()
+    private val scheduledTaskDao = database.scheduledTaskDao()
 
     val settingsFlow: Flow<SettingsEntity?> = settingsDao.observeSettings()
     val historyFlow: Flow<List<ChatHistoryEntity>> = chatHistoryDao.observeHistory()
@@ -423,6 +504,7 @@ class JarvisRepository(private val database: JarvisDatabase) {
     val scheduledCallsFlow: Flow<List<ScheduledCallEntity>> = scheduledCallDao.observeScheduledCalls()
     val pendingAlertsFlow: Flow<List<PendingCallAlertEntity>> = pendingCallAlertDao.observeAlerts()
     val memoriesFlow: Flow<List<UserMemoryEntity>> = userMemoryDao.observeMemories()
+    val scheduledTasksFlow: Flow<List<ScheduledTaskEntity>> = scheduledTaskDao.observeScheduledTasks()
 
     suspend fun ensureDefaultsInitialized(): SettingsEntity {
         val existing = settingsDao.getSettingsOnce()
@@ -541,5 +623,25 @@ class JarvisRepository(private val database: JarvisDatabase) {
 
     suspend fun clearMemories() {
         userMemoryDao.clearAll()
+    }
+
+    suspend fun saveScheduledTask(task: ScheduledTaskEntity): Long {
+        return scheduledTaskDao.upsertTask(task)
+    }
+
+    suspend fun getPendingScheduledTasks(): List<ScheduledTaskEntity> {
+        return scheduledTaskDao.getPendingTasksOnce()
+    }
+
+    suspend fun getScheduledTaskById(id: Long): ScheduledTaskEntity? {
+        return scheduledTaskDao.getTaskById(id)
+    }
+
+    suspend fun updateScheduledTaskStatus(id: Long, status: String) {
+        scheduledTaskDao.updateTaskStatus(id, status)
+    }
+
+    suspend fun deleteScheduledTask(task: ScheduledTaskEntity) {
+        scheduledTaskDao.deleteTask(task)
     }
 }

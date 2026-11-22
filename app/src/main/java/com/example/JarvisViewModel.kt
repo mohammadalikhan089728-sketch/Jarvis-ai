@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.util.Calendar
 import java.util.Locale
 
 enum class JarvisPhase {
@@ -98,6 +99,9 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     val scheduledCalls: StateFlow<List<ScheduledCallEntity>> = repository.scheduledCallsFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    val scheduledTasks: StateFlow<List<ScheduledTaskEntity>> = repository.scheduledTasksFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
     val pendingAlerts: StateFlow<List<PendingCallAlertEntity>> = repository.pendingAlertsFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
@@ -110,6 +114,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     val lastAutoReplyBanner: StateFlow<String> = JarvisNotificationListenerService.lastAutoReplyBanner
     val activeVoiceLabel: StateFlow<String> = previewVoiceEngine.activeVoiceLabel
     val lastVoiceStatus: StateFlow<String> = previewVoiceEngine.lastVoiceStatus
+    val liveAudioConnected: StateFlow<Boolean> = PersistentLiveAudioSession.isSessionConnected
     val overlayRunning: StateFlow<Boolean> = FloatingOrbService.isRunning
     val wakeWordServiceRunning: StateFlow<Boolean> = JarvisWakeWordService.isRunning
     val networkMonitorRunning: StateFlow<Boolean> = NetworkMonitorService.isRunning
@@ -119,6 +124,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
             val loaded = repository.ensureDefaultsInitialized()
             refreshPermissions()
             CallAlarmScheduler.rescheduleAllEnabledCalls(appContext)
+            TaskSchedulerAndAutomationManager.rescheduleAllPendingTasks(appContext)
             if (loaded.floatingOverlayEnabled && Settings.canDrawOverlays(appContext)) {
                 FloatingOrbService.start(appContext)
             }
@@ -311,6 +317,66 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
             actionType = CALL_TYPE_WAKE_UP_STUDY,
             alertSummary = "JARVIS incoming call test triggered from Config."
         )
+    }
+
+    fun addScheduledAutomationTask(
+        taskType: String,
+        target: String,
+        messageText: String,
+        hour: Int,
+        minute: Int,
+        repeatDaily: Boolean
+    ) {
+        val cleanTarget = target.trim()
+        val cleanMsg = messageText.trim()
+        if (cleanTarget.isEmpty() && taskType != TASK_TYPE_INSTAGRAM_REELS && taskType != TASK_TYPE_ALARM) return
+
+        viewModelScope.launch {
+            val cal = Calendar.getInstance().apply {
+                set(Calendar.HOUR_OF_DAY, hour.coerceIn(0, 23))
+                set(Calendar.MINUTE, minute.coerceIn(0, 59))
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+                if (timeInMillis <= System.currentTimeMillis() + 5_000L) {
+                    add(Calendar.DAY_OF_YEAR, 1)
+                }
+            }
+            val appPkg = when (taskType) {
+                TASK_TYPE_WHATSAPP_MSG -> "com.whatsapp"
+                TASK_TYPE_INSTAGRAM_DM, TASK_TYPE_INSTAGRAM_REELS -> "com.instagram.android"
+                TASK_TYPE_YOUTUBE_PLAY -> "com.google.android.youtube"
+                else -> ""
+            }
+            val entity = ScheduledTaskEntity(
+                taskType = taskType,
+                target = cleanTarget.ifBlank { taskType },
+                messageText = cleanMsg,
+                appPackage = appPkg,
+                triggerAtMillis = cal.timeInMillis,
+                repeatDaily = repeatDaily,
+                status = TASK_STATUS_PENDING
+            )
+            TaskSchedulerAndAutomationManager.scheduleTask(appContext, repository, entity)
+            val timeLabel = CallAlarmScheduler.formatTime12Hour(hour, minute)
+            _localStatusBanner.value = "Scheduled $taskType for $timeLabel"
+        }
+    }
+
+    fun deleteScheduledAutomationTask(task: ScheduledTaskEntity) {
+        viewModelScope.launch {
+            TaskSchedulerAndAutomationManager.cancelTask(appContext, task.id)
+            repository.deleteScheduledTask(task)
+            _localStatusBanner.value = "Scheduled automation task removed"
+        }
+    }
+
+    fun runScheduledTaskNow(task: ScheduledTaskEntity) {
+        viewModelScope.launch {
+            _localStatusBanner.value = "Executing ${task.taskType} -> ${task.target}…"
+            val resultMsg = TaskSchedulerAndAutomationManager.executeTaskNow(appContext, task)
+            repository.updateScheduledTaskStatus(task.id, TASK_STATUS_EXECUTED)
+            _localStatusBanner.value = resultMsg
+        }
     }
 
     fun runDiagnosticTapTest(onResult: (Boolean) -> Unit) {

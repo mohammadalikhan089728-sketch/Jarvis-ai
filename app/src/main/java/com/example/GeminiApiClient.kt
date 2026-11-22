@@ -194,8 +194,16 @@ class GeminiApiClient {
     private fun generateUrl(modelId: String) = "$API_BASE_URL/$modelId:generateContent"
     private fun streamUrl(modelId: String) = "$API_BASE_URL/$modelId:streamGenerateContent?alt=sse"
 
+    /**
+     * NEVER rapidly auto-retry on 429 or 404 (prevents RPM/RPD quota lockouts).
+     * Only trigger silent single-hop failover on transient 500/503 server hiccups.
+     */
     private fun shouldFailoverHttpCode(code: Int): Boolean {
-        return code == 404 || code == 429 || code == 500 || code == 503
+        if (code == 429 || code == 404) {
+            PersistentLiveAudioSession.triggerQuotaCooldown()
+            return false
+        }
+        return code == 500 || code == 503
     }
 
     suspend fun verifyApiKey(
@@ -281,7 +289,11 @@ class GeminiApiClient {
             return@withContext Result.failure(IllegalStateException("AI Voice requires an active key and clean text."))
         }
 
-        val resolvedVoice = if (voiceName == AI_VOICE_FENRIR) AI_VOICE_FENRIR else AI_VOICE_CHARON
+        val resolvedVoice = when (voiceName.trim()) {
+            AI_VOICE_ORUS -> AI_VOICE_ORUS
+            AI_VOICE_FENRIR -> AI_VOICE_FENRIR
+            else -> AI_VOICE_CHARON
+        }
         val encodedKey = URLEncoder.encode(apiKey, "UTF-8")
         val wsUrl = "$BIDI_LIVE_WS_BASE_URL?key=$encodedKey"
 
@@ -492,12 +504,20 @@ class GeminiApiClient {
             )
         }
 
+        if (PersistentLiveAudioSession.isInQuotaCooldown()) {
+            val sec = PersistentLiveAudioSession.remainingCooldownSeconds()
+            return@withContext Result.failure(
+                IllegalStateException("Sir, rate-limit protection active hai (${sec}s). Offline controls abhi bhi kaam kar rahe hain.")
+            )
+        }
+
         val systemText = buildString {
             append(masterSystemPrompt.ifBlank { DEFAULT_MASTER_PROMPT })
             appendLine()
             appendLine("IDENTITY & VOICE OUTPUT RULES:")
-            appendLine("- You are JARVIS, developed by Mozahid. Never mention any external AI brand or model name.")
-            appendLine("- Respond ONLY in clean, natural spoken sentences (1-2 short sentences). NEVER output JSON, brackets, markdown fences, asterisks, or bullet lists.")
+            appendLine("- You are J.A.R.V.I.S. (Just A Rather Very Intelligent System), created and developed by Mozahid (your creator and boss, like Tony Stark).")
+            appendLine("- If asked who you are, who created you, or what model you are, reply verbatim: \"$JARVIS_IDENTITY_REPLY\"")
+            appendLine("- Always respond ONLY in crisp, natural Hinglish (1-2 short spoken sentences). NEVER output JSON, brackets, markdown fences, asterisks, or bullet lists.")
             if (memoryContext.isNotBlank()) {
                 appendLine()
                 appendLine("USER LONG-TERM MEMORY:")
@@ -713,6 +733,12 @@ class GeminiApiClient {
         if (apiKey.isEmpty()) {
             return@withContext Result.failure(
                 IllegalStateException("JARVIS AI Core key is not configured. Open Config to enter your key.")
+            )
+        }
+        if (PersistentLiveAudioSession.isInQuotaCooldown()) {
+            val sec = PersistentLiveAudioSession.remainingCooldownSeconds()
+            return@withContext Result.failure(
+                IllegalStateException("Rate-limit cooldown active (${sec}s) to protect your daily quota.")
             )
         }
 
@@ -998,12 +1024,12 @@ class GeminiApiClient {
             append(
                 """
 COMPACT AGENT PROTOCOL (STRICT SINGLE JSON OBJECT ONLY):
-You are JARVIS, developed by Mozahid. Never mention any external AI brand.
+You are J.A.R.V.I.S., created and developed by Mozahid. Reply in crisp natural Hinglish (1 short sentence). Never mention any external AI brand.
 Schema:
-{"action":"OPEN_APP|TAP_TEXT|TAP_XY|LONG_PRESS|TYPE_TEXT|SWIPE|SCROLL_DOWN|SCROLL_UP|SCROLL|DRAG|MULTI_TOUCH|BACK|HOME|RECENTS|GLOBAL|DONE|SPEAK","params":{},"reply":"Short clean spoken sentence","save_memory":"optional short user fact to remember or empty"}
+{"action":"OPEN_APP|TAP_TEXT|TAP_XY|LONG_PRESS_XY|LONG_PRESS|TYPE_TEXT|SWIPE|SCROLL_DOWN|SCROLL_UP|SCROLL|DRAG|MULTI_TOUCH|BACK|HOME|RECENTS|GLOBAL|DONE|SPEAK","params":{},"reply":"Short clean Hinglish spoken sentence","save_memory":"optional short user fact to remember or empty"}
 Rules:
 - Execute ONE next action using UI nodes (id,text,x,y). Return DONE once goal completes, SPEAK if no action needed.
-- Params: OPEN_APP{"appName"}, TAP_TEXT{"text"}, TAP_XY{"x","y"}, TYPE_TEXT{"text","submit":true}, SWIPE{"x1","y1","x2","y2"}, SCROLL{"direction"}, DRAG{"startX","startY","endX","endY"}, MULTI_TOUCH{"gesture"}, GLOBAL{"command","target"}.
+- Params: OPEN_APP{"appName"}, TAP_TEXT{"text"}, TAP_XY{"x","y"}, LONG_PRESS_XY{"x","y"}, TYPE_TEXT{"text","submit":true}, SWIPE{"x1","y1","x2","y2"}, SCROLL{"direction"}, DRAG{"startX","startY","endX","endY"}, MULTI_TOUCH{"gesture"}, GLOBAL{"command","target"}.
 - Only fill "save_memory" when user shares a new personal fact/preference/routine worth remembering permanently.
 - No markdown fences or text outside JSON.
                 """.trimIndent()

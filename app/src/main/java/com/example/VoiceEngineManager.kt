@@ -357,14 +357,20 @@ class VoiceEngineManager(
         stop()
         onSpeechFinishedCallback = onComplete
 
-        if (isAiVoiceMode(settings)) {
+        if (isAiVoiceMode(settings) && !PersistentLiveAudioSession.isInQuotaCooldown()) {
             setSpeakingState(true)
             val chosenVoice = settings.aiVoiceName.ifBlank { AI_VOICE_CHARON }
-            _lastVoiceStatus.value = "With AI Voice streaming ($chosenVoice)"
+            _lastVoiceStatus.value = "Single Live AI Voice ($chosenVoice)"
             aiVoiceJob = scope.launch {
-                val streamedOk = streamLiveAiVoiceToAudioTrack(cleanText, settings)
-                if (!streamedOk) {
-                    _lastVoiceStatus.value = "AI Voice unavailable — using Neural Normal Voice"
+                val res = PersistentLiveAudioSession.speakVerbatim(
+                    rawApiKey = settings.geminiApiKey,
+                    textToSpeak = cleanText,
+                    voiceName = chosenVoice
+                )
+                if (res.isSuccess) {
+                    dispatchSpeechFinished(expectedUtteranceId = null)
+                } else {
+                    _lastVoiceStatus.value = "Live Audio paused — using Neural Normal Voice"
                     speakWithSystemTts(cleanText, effectiveNormalPitch(settings), settings.voiceSpeed)
                 }
             }
@@ -509,6 +515,7 @@ class VoiceEngineManager(
         aiVoiceJob?.cancel()
         aiVoiceJob = null
         aiClient.cancelActiveVoiceStream()
+        PersistentLiveAudioSession.interruptCurrentPlayback()
         isStreamingSessionOpen = false
         streamInputFinished = false
         streamSentencesQueuedCount = 0

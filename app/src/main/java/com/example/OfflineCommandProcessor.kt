@@ -119,7 +119,7 @@ class OfflineCommandProcessor(private val context: Context) {
             )
         }
 
-        // 5. Wi-Fi, Bluetooth, and Do Not Disturb (DND) quick controls
+        // 5. Wi-Fi, Bluetooth, Mobile Data, Hotspot, Airplane Mode, Battery Saver, Brightness & DND
         if (!looksMultiStep && (lower.contains("wi-fi") || lower.contains("wifi"))) {
             val msg = openWifiQuickPanel()
             return OfflineExecutionResult("OFFLINE:WIFI", "{}", msg)
@@ -127,6 +127,26 @@ class OfflineCommandProcessor(private val context: Context) {
         if (!looksMultiStep && lower.contains("bluetooth")) {
             val msg = openBluetoothSettings()
             return OfflineExecutionResult("OFFLINE:BLUETOOTH", "{}", msg)
+        }
+        if (!looksMultiStep && (lower.contains("mobile data") || lower.contains("cellular data") || lower.contains("internet data"))) {
+            val msg = openMobileDataSettings()
+            return OfflineExecutionResult("OFFLINE:MOBILE_DATA", "{}", msg)
+        }
+        if (!looksMultiStep && lower.contains("hotspot")) {
+            val msg = openHotspotSettings()
+            return OfflineExecutionResult("OFFLINE:HOTSPOT", "{}", msg)
+        }
+        if (!looksMultiStep && (lower.contains("airplane mode") || lower.contains("flight mode"))) {
+            val msg = openAirplaneModeSettings()
+            return OfflineExecutionResult("OFFLINE:AIRPLANE_MODE", "{}", msg)
+        }
+        if (!looksMultiStep && (lower.contains("battery saver") || lower.contains("power saver"))) {
+            val msg = openBatterySaverSettings()
+            return OfflineExecutionResult("OFFLINE:BATTERY_SAVER", "{}", msg)
+        }
+        if (!looksMultiStep && lower.contains("brightness")) {
+            val msg = openDisplayBrightnessSettings()
+            return OfflineExecutionResult("OFFLINE:BRIGHTNESS", "{}", msg)
         }
         if (!looksMultiStep && (lower.contains("do not disturb") || lower.contains("dnd"))) {
             val enable = when {
@@ -138,18 +158,23 @@ class OfflineCommandProcessor(private val context: Context) {
             return OfflineExecutionResult("OFFLINE:DND", "{}", msg)
         }
 
-        // 6. Volume control
+        // 6. Volume control (Media / Ring / Alarm)
+        val volumeStream = when {
+            lower.contains("ring") || lower.contains("ringer") -> AudioManager.STREAM_RING
+            lower.contains("alarm") -> AudioManager.STREAM_ALARM
+            else -> AudioManager.STREAM_MUSIC
+        }
         if (!looksMultiStep && (lower.contains("volume up") || lower.contains("increase volume") || lower.contains("louder"))) {
-            adjustVolume(AudioManager.ADJUST_RAISE)
-            return OfflineExecutionResult("OFFLINE:VOLUME_UP", "{}", "Volume increased.")
+            adjustVolumeStream(volumeStream, AudioManager.ADJUST_RAISE)
+            return OfflineExecutionResult("OFFLINE:VOLUME_UP", "{}", "Volume badha diya hai Sir.")
         }
         if (!looksMultiStep && (lower.contains("volume down") || lower.contains("decrease volume") || lower.contains("quieter"))) {
-            adjustVolume(AudioManager.ADJUST_LOWER)
-            return OfflineExecutionResult("OFFLINE:VOLUME_DOWN", "{}", "Volume lowered.")
+            adjustVolumeStream(volumeStream, AudioManager.ADJUST_LOWER)
+            return OfflineExecutionResult("OFFLINE:VOLUME_DOWN", "{}", "Volume kam kar diya hai Sir.")
         }
         if (!looksMultiStep && (lower == "mute" || lower.contains("mute volume") || lower.contains("silent mode"))) {
-            adjustVolume(AudioManager.ADJUST_MUTE)
-            return OfflineExecutionResult("OFFLINE:VOLUME_MUTE", "{}", "Media volume muted.")
+            adjustVolumeStream(volumeStream, AudioManager.ADJUST_MUTE)
+            return OfflineExecutionResult("OFFLINE:VOLUME_MUTE", "{}", "Audio mute kar diya hai Sir.")
         }
 
         // 7. Global system actions (AccessibilityService)
@@ -379,10 +404,75 @@ class OfflineCommandProcessor(private val context: Context) {
         }
         return runCatching {
             context.startActivity(intent)
-            "Opening Bluetooth settings."
+            "Bluetooth settings khol di hain Sir."
         }.getOrElse {
-            "Unable to open Bluetooth settings."
+            "Bluetooth settings open nahi ho payi Sir."
         }
+    }
+
+    fun openMobileDataSettings(): String {
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY)
+        } else {
+            Intent(Settings.ACTION_DATA_ROAMING_SETTINGS)
+        }.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return runCatching {
+            context.startActivity(intent)
+            "Mobile Data controls khol diye hain Sir."
+        }.getOrElse {
+            runCatching {
+                context.startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                "Network settings khol di hain Sir."
+            }.getOrElse { "Mobile Data settings available nahi hain Sir." }
+        }
+    }
+
+    fun openHotspotSettings(): String {
+        val tetherIntent = Intent().apply {
+            setClassName("com.android.settings", "com.android.settings.TetherSettings")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return runCatching {
+            context.startActivity(tetherIntent)
+            "Hotspot settings khol di hain Sir."
+        }.getOrElse {
+            runCatching {
+                context.startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                "Network aur Hotspot settings khol di hain Sir."
+            }.getOrElse { "Hotspot panel open nahi ho paya Sir." }
+        }
+    }
+
+    fun openDisplayBrightnessSettings(): String {
+        val intent = Intent(Settings.ACTION_DISPLAY_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return runCatching {
+            context.startActivity(intent)
+            "Display aur Brightness settings khol di hain Sir."
+        }.getOrElse { "Display settings open nahi ho payi Sir." }
+    }
+
+    fun openAirplaneModeSettings(): String {
+        val intent = Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return runCatching {
+            context.startActivity(intent)
+            "Airplane mode settings khol di hain Sir."
+        }.getOrElse { "Airplane mode settings open nahi ho payi Sir." }
+    }
+
+    fun openBatterySaverSettings(): String {
+        val intent = Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        return runCatching {
+            context.startActivity(intent)
+            "Battery Saver settings khol di hain Sir."
+        }.getOrElse { "Battery Saver settings available nahi hain Sir." }
     }
 
     fun toggleDoNotDisturb(enable: Boolean?): String {
@@ -442,10 +532,14 @@ class OfflineCommandProcessor(private val context: Context) {
     }
 
     fun adjustVolume(direction: Int) {
+        adjustVolumeStream(AudioManager.STREAM_MUSIC, direction)
+    }
+
+    fun adjustVolumeStream(streamType: Int, direction: Int) {
         runCatching {
             val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
             audioManager.adjustStreamVolume(
-                AudioManager.STREAM_MUSIC,
+                streamType,
                 direction,
                 AudioManager.FLAG_SHOW_UI
             )
@@ -457,31 +551,56 @@ class OfflineCommandProcessor(private val context: Context) {
         if (query.isEmpty()) return null
 
         val pm = context.packageManager
+
+        // Direct package name launch if caller passed e.g. "com.whatsapp"
+        if (query.contains(".")) {
+            pm.getLaunchIntentForPackage(appNameQuery.trim())?.let { directIntent ->
+                directIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (runCatching { context.startActivity(directIntent); true }.getOrDefault(false)) {
+                    return appNameQuery.trim()
+                }
+            }
+        }
+
         val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
             addCategory(Intent.CATEGORY_LAUNCHER)
         }
         val apps = pm.queryIntentActivities(mainIntent, 0)
 
-        val exact = apps.firstOrNull { info ->
-            info.loadLabel(pm).toString().trim().lowercase(Locale.ROOT) == query
-        }
-        val partial = exact ?: apps.firstOrNull { info ->
+        // Fuzzy ranked match: exact > startsWith > word-match > label contains > package contains
+        val bestMatch = apps.maxByOrNull { info ->
+            val label = info.loadLabel(pm).toString().trim().lowercase(Locale.ROOT)
+            val pkg = info.activityInfo.packageName.lowercase(Locale.ROOT)
+            when {
+                label == query -> 100
+                label.startsWith(query) -> 85
+                label.split(" ", "-", "_").any { it == query } -> 75
+                label.contains(query) -> 60
+                pkg.contains(query) -> 45
+                else -> 0
+            }
+        }?.takeIf { info ->
             val label = info.loadLabel(pm).toString().trim().lowercase(Locale.ROOT)
             val pkg = info.activityInfo.packageName.lowercase(Locale.ROOT)
             label.contains(query) || pkg.contains(query)
         } ?: return null
 
-        val packageName = partial.activityInfo.packageName
+        val packageName = bestMatch.activityInfo.packageName
         val launchIntent = pm.getLaunchIntentForPackage(packageName)?.apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         } ?: return null
 
         return try {
             context.startActivity(launchIntent)
-            partial.loadLabel(pm).toString()
+            bestMatch.loadLabel(pm).toString()
         } catch (_: Exception) {
             null
         }
+    }
+
+    fun resolvePhoneNumberOrNull(target: String): String? {
+        val cleanDigits = target.filter { it.isDigit() || it == '+' }
+        return if (cleanDigits.length >= 7) cleanDigits else lookupContactPhoneNumber(target)
     }
 
     fun initiateCall(target: String): String {
