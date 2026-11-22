@@ -206,7 +206,9 @@ class JarvisActiveAssistantService : Service() {
         if (!initialCommand.isNullOrBlank()) {
             serviceScope.launch {
                 val currentSettings = repository.getSettings()
-                if (currentSettings.voiceMode == VOICE_MODE_AI_VOICE &&
+                val wantsLiveWs = currentSettings.coreEngine == ENGINE_V31_LIVE ||
+                    currentSettings.voiceMode == VOICE_MODE_AI_VOICE
+                if (wantsLiveWs &&
                     currentSettings.geminiApiKey.isNotBlank() &&
                     !PersistentLiveAudioSession.isInQuotaCooldown()
                 ) {
@@ -222,7 +224,8 @@ class JarvisActiveAssistantService : Service() {
         } else {
             serviceScope.launch {
                 val currentSettings = repository.getSettings()
-                val canUseNativeLive = currentSettings.voiceMode == VOICE_MODE_AI_VOICE &&
+                val canUseNativeLive = (currentSettings.coreEngine == ENGINE_V31_LIVE ||
+                    currentSettings.voiceMode == VOICE_MODE_AI_VOICE) &&
                     currentSettings.geminiApiKey.isNotBlank() &&
                     !PersistentLiveAudioSession.isInQuotaCooldown()
 
@@ -679,7 +682,8 @@ class JarvisActiveAssistantService : Service() {
             markSpeechActivity()
             serviceScope.launch {
                 val currentSettings = repository.getSettings()
-                val canResumeNative = currentSettings.voiceMode == VOICE_MODE_AI_VOICE &&
+                val canResumeNative = (currentSettings.coreEngine == ENGINE_V31_LIVE ||
+                    currentSettings.voiceMode == VOICE_MODE_AI_VOICE) &&
                     currentSettings.geminiApiKey.isNotBlank() &&
                     !PersistentLiveAudioSession.isInQuotaCooldown()
                 if (canResumeNative) {

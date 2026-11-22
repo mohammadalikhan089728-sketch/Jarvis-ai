@@ -152,10 +152,10 @@ fun SettingsScreen(
     } else {
         VOICE_MODE_NORMAL
     }
-    val normalizedInitialEngine = if (settings.coreEngine == ENGINE_V35_DEEP) {
-        ENGINE_V35_DEEP
-    } else {
-        ENGINE_V25_LITE
+    val normalizedInitialEngine = when (settings.coreEngine) {
+        ENGINE_V25_LITE -> ENGINE_V25_LITE
+        ENGINE_V35_DEEP -> ENGINE_V35_DEEP
+        else -> ENGINE_V31_LIVE
     }
 
     var apiKey by rememberSaveable { mutableStateOf(settings.geminiApiKey) }
@@ -163,7 +163,7 @@ fun SettingsScreen(
     var coreEngine by rememberSaveable { mutableStateOf(normalizedInitialEngine) }
     var masterPrompt by rememberSaveable { mutableStateOf(settings.masterSystemPrompt) }
     var voiceMode by rememberSaveable { mutableStateOf(normalizedInitialMode) }
-    var aiVoiceName by rememberSaveable { mutableStateOf(settings.aiVoiceName.ifBlank { AI_VOICE_CHARON }) }
+    var aiVoiceName by rememberSaveable { mutableStateOf(settings.aiVoiceName.ifBlank { AI_VOICE_PUCK }) }
     var voicePitch by rememberSaveable { mutableFloatStateOf(settings.voicePitch) }
     var voiceSpeed by rememberSaveable { mutableFloatStateOf(settings.voiceSpeed) }
     var wakeWordEnabled by rememberSaveable { mutableStateOf(settings.wakeWordEnabled) }
@@ -183,10 +183,14 @@ fun SettingsScreen(
     // Synchronize local form fields when Room emits saved updates
     LaunchedEffect(settings.updatedAt) {
         apiKey = settings.geminiApiKey
-        coreEngine = if (settings.coreEngine == ENGINE_V35_DEEP) ENGINE_V35_DEEP else ENGINE_V25_LITE
+        coreEngine = when (settings.coreEngine) {
+            ENGINE_V25_LITE -> ENGINE_V25_LITE
+            ENGINE_V35_DEEP -> ENGINE_V35_DEEP
+            else -> ENGINE_V31_LIVE
+        }
         masterPrompt = settings.masterSystemPrompt
         voiceMode = if (settings.voiceMode == VOICE_MODE_AI_VOICE) VOICE_MODE_AI_VOICE else VOICE_MODE_NORMAL
-        aiVoiceName = settings.aiVoiceName.ifBlank { AI_VOICE_CHARON }
+        aiVoiceName = settings.aiVoiceName.ifBlank { AI_VOICE_PUCK }
         voicePitch = settings.voicePitch
         voiceSpeed = settings.voiceSpeed
         wakeWordEnabled = settings.wakeWordEnabled
@@ -217,7 +221,7 @@ fun SettingsScreen(
             autoReplyTargetContact = autoReplyTargetContact.trim(),
             customWakeWord = customWakeWord.trim().ifBlank { "Jarvis" },
             alwaysOnWakeWordEnabled = alwaysOnWakeWord,
-            aiVoiceName = aiVoiceName.ifBlank { AI_VOICE_CHARON },
+            aiVoiceName = aiVoiceName.ifBlank { AI_VOICE_PUCK },
             onlineAutoCallEnabled = onlineAutoCallEnabled,
             coreEngine = coreEngine
         )
@@ -776,19 +780,35 @@ fun SettingsScreen(
                 }
             }
 
-            // 4B. JARVIS Core Engine Selector (2 Selectable Engines + Silent Automatic Failover)
+            // 4B. JARVIS Core Engine Selector (v3.1 Live Default + v2.5 & v3.5 Fallbacks)
             SettingsSectionCard(
                 title = "JARVIS CORE ENGINE",
                 icon = Icons.Filled.Memory
             ) {
                 Text(
-                    text = "Select your active JARVIS intelligence core. Silent automatic failover switches instantly if one tier hits a rate limit or network hiccup.",
+                    text = "Select your active JARVIS intelligence core. v3.1 Live streams real-time native audio with Puck voice and falls back automatically to v2.5 or v3.5 if needed.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(10.dp))
                 VoiceOptionRow(
-                    title = "Core Engine v2.5 (Ultra-Fast & Max Daily Limit — Default)",
+                    title = "Core Engine v3.1 Live (Real-Time Voice & Ultra-Low Quota — Puck)",
+                    subtitle = "Default • Single persistent Live WebSocket with native Puck audio (16kHz in / 24kHz out), lazy screen reading & v2.5/v3.5 fallback",
+                    badgeText = "DEFAULT • LIVE",
+                    badgeColor = ArcCyan,
+                    selected = coreEngine == ENGINE_V31_LIVE,
+                    onSelect = {
+                        coreEngine = ENGINE_V31_LIVE
+                        voiceMode = VOICE_MODE_AI_VOICE
+                        aiVoiceName = AI_VOICE_PUCK
+                        onSaveSettings(buildCurrentEntity())
+                        savedBanner = "Active engine switched to Core Engine v3.1 Live (Puck)."
+                    },
+                    tag = "core_engine_v31_live_radio"
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                VoiceOptionRow(
+                    title = "Core Engine v2.5 (Ultra-Fast & Max Daily Limit — Fallback)",
                     subtitle = "Optimized for 1,000+ daily requests, zero-thinking latency, and instant voice replies",
                     badgeText = "10X QUOTA",
                     badgeColor = SignalGreen,
@@ -805,7 +825,7 @@ fun SettingsScreen(
                     title = "Core Engine v3.5 (Deep Reasoning Backup)",
                     subtitle = "High-precision reasoning tier with automatic fallback to v2.5 if rate-limited",
                     badgeText = "DEEP BACKUP",
-                    badgeColor = ArcCyan,
+                    badgeColor = StarkAmber,
                     selected = coreEngine == ENGINE_V35_DEEP,
                     onSelect = {
                         coreEngine = ENGINE_V35_DEEP
@@ -880,10 +900,10 @@ fun SettingsScreen(
                     border = BorderStroke(1.dp, ArcCyan.copy(alpha = 0.45f))
                 ) {
                     Text(
-                        text = if (coreEngine == ENGINE_V35_DEEP) {
-                            "ACTIVE CORE: JARVIS ENGINE v3.5"
-                        } else {
-                            "ACTIVE CORE: JARVIS ENGINE v2.5"
+                        text = when (coreEngine) {
+                            ENGINE_V31_LIVE -> "ACTIVE CORE: JARVIS ENGINE v3.1 LIVE (PUCK)"
+                            ENGINE_V35_DEEP -> "ACTIVE CORE: JARVIS ENGINE v3.5"
+                            else -> "ACTIVE CORE: JARVIS ENGINE v2.5"
                         },
                         style = MaterialTheme.typography.labelMedium,
                         color = ArcCyan,

@@ -248,7 +248,8 @@ class VoiceEngineManager(
     }
 
     private fun isAiVoiceMode(settings: SettingsEntity): Boolean {
-        return settings.voiceMode == VOICE_MODE_AI_VOICE && settings.geminiApiKey.isNotBlank()
+        return (settings.coreEngine == ENGINE_V31_LIVE || settings.voiceMode == VOICE_MODE_AI_VOICE) &&
+            settings.geminiApiKey.isNotBlank()
     }
 
     private fun effectiveNormalPitch(settings: SettingsEntity): Float {

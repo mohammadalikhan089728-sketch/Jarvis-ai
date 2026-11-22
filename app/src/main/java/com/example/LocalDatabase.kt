@@ -22,6 +22,7 @@ const val VOICE_MODE_DEFAULT = VOICE_MODE_NORMAL
 const val VOICE_MODE_CUSTOM_URL = "CUSTOM_URL"
 
 // Selectable Core Engines (Never expose third-party model names in UI)
+const val ENGINE_V31_LIVE = "CORE_V31_LIVE"
 const val ENGINE_V25_LITE = "CORE_V25"
 const val ENGINE_V35_DEEP = "CORE_V35"
 
@@ -111,7 +112,7 @@ data class SettingsEntity(
     val alwaysOnWakeWordEnabled: Boolean = false,
     val aiVoiceName: String = AI_VOICE_PUCK,
     val onlineAutoCallEnabled: Boolean = true,
-    val coreEngine: String = ENGINE_V25_LITE,
+    val coreEngine: String = ENGINE_V31_LIVE,
     val updatedAt: Long = System.currentTimeMillis()
 )
 

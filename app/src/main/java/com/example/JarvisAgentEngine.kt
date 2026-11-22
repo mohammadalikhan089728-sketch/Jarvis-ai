@@ -247,12 +247,19 @@ class JarvisAgentEngine(
             val projectMemory = intelligenceModules.buildActiveProjectContextBlock()
             val memoryContext = listOf(baseMemory, projectMemory).filter { it.isNotBlank() }.joinToString("\n\n")
 
-            if (settings.voiceMode == VOICE_MODE_AI_VOICE && !PersistentLiveAudioSession.isInQuotaCooldown()) {
+            val useLiveWebSocket = (settings.coreEngine == ENGINE_V31_LIVE || settings.voiceMode == VOICE_MODE_AI_VOICE) &&
+                !PersistentLiveAudioSession.isInQuotaCooldown()
+            if (useLiveWebSocket) {
                 onPhaseUpdate(JarvisPhase.SPEAKING)
+                val liveVoice = if (settings.coreEngine == ENGINE_V31_LIVE) {
+                    settings.aiVoiceName.ifBlank { AI_VOICE_PUCK }
+                } else {
+                    settings.aiVoiceName.ifBlank { AI_VOICE_PUCK }
+                }
                 val liveResult = PersistentLiveAudioSession.sendConversationalTurn(
                     rawApiKey = settings.geminiApiKey,
                     userText = query,
-                    voiceName = settings.aiVoiceName.ifBlank { AI_VOICE_PUCK },
+                    voiceName = liveVoice,
                     masterSystemPrompt = settings.masterSystemPrompt,
                     memoryContext = memoryContext,
                     context = appContext

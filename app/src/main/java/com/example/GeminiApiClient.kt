@@ -208,11 +208,22 @@ class GeminiApiClient {
 
     suspend fun verifyApiKey(
         rawApiKey: String,
-        selectedEngine: String = ENGINE_V25_LITE
+        selectedEngine: String = ENGINE_V31_LIVE
     ): KeyVerificationResult = withContext(Dispatchers.IO) {
         val apiKey = rawApiKey.trim()
         if (apiKey.isEmpty()) {
             return@withContext KeyVerificationResult.Invalid("API key is empty. Enter a valid JARVIS AI Core key.")
+        }
+
+        if (selectedEngine == ENGINE_V31_LIVE) {
+            val liveStart = System.currentTimeMillis()
+            val liveOk = PersistentLiveAudioSession.ensureConnected(
+                rawApiKey = apiKey,
+                voiceName = AI_VOICE_PUCK
+            )
+            if (liveOk) {
+                return@withContext KeyVerificationResult.Valid(latencyMs = System.currentTimeMillis() - liveStart)
+            }
         }
 
         val chain = resolveEngineChain(selectedEngine)

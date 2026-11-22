@@ -456,8 +456,9 @@ class JarvisUpgradeVerificationTest {
         assertEquals("audio/pcm;rate=16000", chunk.getString("mimeType"))
         assertTrue(chunk.getString("data").isNotBlank())
 
-        // Verify SettingsEntity defaults: AI Voice + Puck + lazy screen reading (autoReadScreenContext = false)
+        // Verify SettingsEntity defaults: Core Engine v3.1 Live + AI Voice + Puck + lazy screen reading
         val defaultSettings = SettingsEntity()
+        assertEquals(ENGINE_V31_LIVE, defaultSettings.coreEngine)
         assertEquals(VOICE_MODE_AI_VOICE, defaultSettings.voiceMode)
         assertEquals(AI_VOICE_PUCK, defaultSettings.aiVoiceName)
         assertFalse("Screen reading must be lazy (off by default on normal turns)", defaultSettings.autoReadScreenContext)
