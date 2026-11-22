@@ -86,6 +86,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.example.ui.CreatorSettingsSection
 import com.example.ui.theme.ArcCyan
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.SignalCrimson
@@ -135,6 +136,15 @@ fun SettingsScreen(
     onDeleteUserMemory: (UserMemoryEntity) -> Unit,
     onTestIncomingCall: () -> Unit,
     onTestScreenTap: () -> Unit,
+    creatorConfig: YouTubeCreatorConfig = YouTubeCreatorConfig(),
+    oauthStatus: String = "",
+    youtubeTestStatus: String = "",
+    onSaveCreatorConfig: (YouTubeCreatorConfig) -> Unit = {},
+    onStartYouTubeOAuth: (clientId: String) -> Unit = {},
+    onTestYouTubeConnection: () -> Unit = {},
+    onDisconnectYouTube: () -> Unit = {},
+    onTestMilestoneCall: () -> Unit = {},
+    onOpenYouTubeControlCenter: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val normalizedInitialMode = if (settings.voiceMode == VOICE_MODE_AI_VOICE) {
@@ -1118,6 +1128,19 @@ fun SettingsScreen(
                     }
                 }
             }
+
+            // 8. Independent YouTube Creator Control Center, Milestones, Clipping & Intelligence Settings
+            CreatorSettingsSection(
+                config = creatorConfig,
+                oauthStatus = oauthStatus,
+                youtubeTestStatus = youtubeTestStatus,
+                onSaveConfig = onSaveCreatorConfig,
+                onStartYouTubeOAuth = onStartYouTubeOAuth,
+                onTestYouTubeConnection = onTestYouTubeConnection,
+                onDisconnectYouTube = onDisconnectYouTube,
+                onTestMilestoneCall = onTestMilestoneCall,
+                onOpenYouTubeControlCenter = onOpenYouTubeControlCenter
+            )
 
             Spacer(modifier = Modifier.height(16.dp))
         }

@@ -25,6 +25,12 @@ class JarvisAgentEngine(
 ) {
 
     private val memoryManager = MemoryManager(repository)
+    private val intelligenceModules = JarvisIntelligenceModules(
+        appContext = appContext,
+        repository = repository,
+        aiClient = aiClient,
+        offlineProcessor = offlineProcessor
+    )
     private val localRouter = LocalCommandRouter(
         appContext = appContext,
         repository = repository,
@@ -119,6 +125,71 @@ class JarvisAgentEngine(
             return result
         }
 
+        // 4B. Personal Command Language (Custom User Voice Shortcuts & Chained Workflows)
+        intelligenceModules.matchAndExecutePersonalCommand(query, settings, onStatusUpdate)?.let { (cmd, reply) ->
+            onPhaseUpdate(JarvisPhase.ACTING)
+            val res = AgentExecutionResult(
+                executedAction = "PERSONAL_CMD:${cmd.triggerPhrase}",
+                paramsJson = JSONObject().put("trigger", cmd.triggerPhrase).toString(),
+                reply = reply,
+                isOffline = true,
+                latencyMs = System.currentTimeMillis() - startMs
+            )
+            logAndReturn(query, res)
+            return res
+        }
+
+        // 4C. Mission Mode Voice Trigger ("mission mode ...", "start mission ...")
+        if (normalizedLower.startsWith("mission mode") || normalizedLower.startsWith("start mission") || normalizedLower.startsWith("run mission")) {
+            val goal = query.replace(Regex("(?i)^(?:mission\\s+mode|start\\s+mission|run\\s+mission)[:\\s-]*"), "").trim()
+            if (goal.isNotBlank()) {
+                onPhaseUpdate(JarvisPhase.ACTING)
+                val run = intelligenceModules.executeMissionCommand(goal, settings, onStatusUpdate)
+                val res = AgentExecutionResult(
+                    executedAction = "MISSION:${run.status}",
+                    paramsJson = JSONObject().put("steps", run.totalSteps).put("completed", run.completedSteps).toString(),
+                    reply = run.summary,
+                    isOffline = false,
+                    latencyMs = System.currentTimeMillis() - startMs
+                )
+                logAndReturn(query, res)
+                return res
+            }
+        }
+
+        // 4D. What-If Simulator Voice Trigger ("what if ...", "simulate ...")
+        if (normalizedLower.startsWith("what if ") || normalizedLower.startsWith("what-if ") || normalizedLower.startsWith("simulate ")) {
+            onPhaseUpdate(JarvisPhase.THINKING)
+            val sim = intelligenceModules.runWhatIfSimulation(query, settings)
+            val reply = sim.getOrElse { it.localizedMessage ?: "What-If analysis requires JARVIS AI Core key." }
+            val res = AgentExecutionResult(
+                executedAction = "INTELLIGENCE:WHAT_IF",
+                paramsJson = "{}",
+                reply = reply.take(550),
+                isOffline = false,
+                latencyMs = System.currentTimeMillis() - startMs
+            )
+            logAndReturn(query, res)
+            return res
+        }
+
+        // 4E. Infinite Project Memory Voice Trigger ("resume project ...", "create project ...")
+        if (normalizedLower.startsWith("resume project ") || normalizedLower.startsWith("create project ") || normalizedLower.startsWith("new project ")) {
+            val title = query.replace(Regex("(?i)^(?:resume|create|new)\\s+project\\s+"), "").trim()
+            if (title.isNotBlank()) {
+                val proj = intelligenceModules.createOrResumeProject(title = title, description = "Voice-activated project context")
+                val res = AgentExecutionResult(
+                    executedAction = "PROJECT:ACTIVE",
+                    paramsJson = JSONObject().put("project", proj.title).toString(),
+                    reply = "Project \"${proj.title}\" is now active in Infinite Project Memory, Sir. Pending tasks: ${proj.pendingTasksCsv.ifBlank { "none yet" }}.",
+                    isOffline = true,
+                    latencyMs = System.currentTimeMillis() - startMs
+                )
+                logAndReturn(query, res)
+                return res
+            }
+        }
+
         // 5. Local Room Custom Macros
         val macros = repository.getAllMacros()
         val matchedMacro = macros.firstOrNull { macro ->
@@ -171,7 +242,9 @@ class JarvisAgentEngine(
         //    - Otherwise (or if Live Audio is unavailable/in cooldown), use ultra-fast streaming TTS.
         if (isPureConversationalQuery(normalizedLower)) {
             onPhaseUpdate(JarvisPhase.THINKING)
-            val memoryContext = memoryManager.buildCompactMemoryContext(query)
+            val baseMemory = memoryManager.buildCompactMemoryContext(query)
+            val projectMemory = intelligenceModules.buildActiveProjectContextBlock()
+            val memoryContext = listOf(baseMemory, projectMemory).filter { it.isNotBlank() }.joinToString("\n\n")
 
             if (settings.voiceMode == VOICE_MODE_AI_VOICE && !PersistentLiveAudioSession.isInQuotaCooldown()) {
                 onPhaseUpdate(JarvisPhase.SPEAKING)
@@ -443,9 +516,19 @@ class JarvisAgentEngine(
                 stepsExecuted++
                 stepHistory.add("$actionUpper(${aiAction.params}) -> ${execNote ?: "OK"}")
 
-                if (execNote != null && execNote.contains("Accessibility Service inactive", ignoreCase = true)) {
-                    finalReply = "${aiAction.reply} ($execNote)"
-                    break
+                if (execNote != null) {
+                    val cfg = SecureCredentialVault.getInstance(appContext).loadConfig()
+                    if (cfg.selfImprovementAutoLearn) {
+                        intelligenceModules.analyzeFailureAndSaveStrategy(
+                            taskPattern = "$actionUpper ($goalQuery)".take(90),
+                            errorDetail = execNote,
+                            settings = settings
+                        )
+                    }
+                    if (execNote.contains("Accessibility Service inactive", ignoreCase = true)) {
+                        finalReply = "${aiAction.reply} ($execNote)"
+                        break
+                    }
                 }
 
                 // Mandatory post-action 750ms UI settle + fresh interactive window refresh so touches NEVER freeze after Home/app switch

@@ -307,6 +307,14 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                 Keep it concise (2 short sentences). Respond in plain spoken sentences only (no JSON).
             """.trimIndent()
 
+            CALL_TYPE_YOUTUBE_MILESTONE -> """
+                You just placed an in-app JARVIS milestone call to celebrate a YouTube video view milestone!
+                Milestone Summary: $alertsText.
+                Purpose: "$callPurpose".
+                Congratulate the user warmly in natural Hinglish/English, clearly announce the video title, crossed milestone, current views, and recent growth, then offer to discuss YouTube strategy, pinned comments, Shorts clips, or next video ideas.
+                Never guarantee future virality. Keep it energetic and concise (2-3 short spoken sentences, no JSON).
+            """.trimIndent()
+
             else -> """
                 You just called the user for a scheduled JARVIS call.
                 Scheduled Purpose: "$callPurpose".
@@ -334,6 +342,8 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                     "Sir, $callPurpose ka time ho gaya hai. ${callAlertSummary.ifBlank { "Abhi tak koi bada milestone alert nahi aaya." }} Kya main ek baar Instagram ya YouTube khol kar views check kar du?"
                 CALL_TYPE_ONLINE_ALERT ->
                     "Sir, urgent update! $callPurpose. $callAlertSummary"
+                CALL_TYPE_YOUTUBE_MILESTONE ->
+                    "Congratulations Sir! ${callAlertSummary.ifBlank { callPurpose }} Would you like to discuss our next YouTube strategy?"
                 else ->
                     "Hello Sir, JARVIS calling for: $callPurpose."
             }
@@ -351,6 +361,8 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                 "ACTIVE WAKE-UP / STUDY CALL: Keep motivating the user gently and asking short interactive questions until they confirm they are fully awake and ready to study."
             CALL_TYPE_SMART_VIEWS_CHECK ->
                 "ACTIVE SMART VIEWS CHECK CALL: Be helpful and non-spammy. Only open Instagram/YouTube if the user explicitly says yes."
+            CALL_TYPE_YOUTUBE_MILESTONE ->
+                "ACTIVE YOUTUBE MILESTONE CALL: Discuss practical YouTube creator growth strategy (hook, title/thumbnail iteration, Shorts spin-offs, audience retention) based on the milestone alert: $callAlertSummary. Never guarantee views or virality. Keep replies concise (1-2 spoken sentences)."
             else ->
                 "ACTIVE LIVE VOICE CALL: Keep responses warm, concise (1-2 sentences), and conversational."
         }
@@ -734,6 +746,7 @@ private fun JarvisCallScreenUi(
         CALL_TYPE_WAKE_UP_STUDY -> "WAKE-UP & STUDY CALL"
         CALL_TYPE_SMART_VIEWS_CHECK -> "SMART VIEWS CHECK"
         CALL_TYPE_ONLINE_ALERT -> "VIRAL / URGENT ALERT"
+        CALL_TYPE_YOUTUBE_MILESTONE -> "YOUTUBE MILESTONE CALL"
         else -> "SCHEDULED JARVIS CALL"
     }
 

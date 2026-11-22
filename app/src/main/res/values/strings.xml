@@ -9,6 +9,8 @@
     <string name="recognition_service_label">JARVIS Speech Recognition</string>
     <string name="notification_listener_label">JARVIS Smart Chat &amp; Alert Listener</string>
     <string name="nav_hud">HUD</string>
+    <string name="nav_intel">Intel</string>
+    <string name="nav_youtube">YouTube</string>
     <string name="nav_macros">Macros</string>
     <string name="nav_permissions">Systems</string>
     <string name="nav_settings">Config</string>
@@ -36,4 +38,7 @@
     <string name="cd_decline_call">Decline incoming JARVIS call</string>
     <string name="cd_end_call">End active JARVIS call</string>
     <string name="cd_toggle_mute">Toggle call microphone mute</string>
+    <string name="cd_channel_avatar">Authorized YouTube channel avatar</string>
+    <string name="cd_video_thumbnail">YouTube video thumbnail preview</string>
+    <string name="cd_clip_preview">Generated MP4 clip frame preview</string>
 </resources>

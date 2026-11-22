@@ -88,6 +88,23 @@
             android:theme="@style/Theme.MyApplication"
             android:turnScreenOn="true" />
 
+        <!-- Secure Google OAuth 2.0 PKCE Redirect Receiver for YouTube Creator Control Center -->
+        <activity
+            android:name=".YouTubeOAuthRedirectActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:noHistory="true"
+            android:theme="@style/Theme.MyApplication">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="com.aistudio.jarvis.kxqzmp"
+                    android:path="/oauth2redirect" />
+            </intent-filter>
+        </activity>
+
         <!-- System Default Digital Assistant App Services -->
         <service
             android:name=".JarvisVoiceInteractionService"

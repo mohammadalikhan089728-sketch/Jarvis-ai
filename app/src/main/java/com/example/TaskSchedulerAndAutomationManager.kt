@@ -705,21 +705,23 @@ object TaskSchedulerAndAutomationManager {
             }
         }
 
-        // 7. YouTube Search & Play ("YouTube pe Arijit Singh chalao", "Play ... on YouTube")
+        // 7. Single-step YouTube Search & Play (multi-step commands like "Go to home screen, open YouTube, search MrBeast, open a video and play it"
+        //    are handled sequentially by NaturalLanguageActionPlanner so every step runs and ONLY the clean keyword is searched)
         if (lower.contains("youtube") && (lower.contains("play") || lower.contains("chalao") || lower.contains("search") || lower.contains("bajao") || lower.contains("sunao"))) {
-            val cleaned = query
-                .replace(Regex("(?i)\\b(youtube|pe|par|mein|me|on|open|kholo|aur|and|play|chalao|search|karo|bajao|sunao|video|song|gaana)\\b"), " ")
-                .replace(Regex("\\s+"), " ")
-                .trim()
-            if (cleaned.length >= 2) {
-                return ParsedAutomationTask(
-                    taskType = TASK_TYPE_YOUTUBE_PLAY,
-                    target = cleaned,
-                    messageText = "",
-                    appPackage = "com.google.android.youtube",
-                    triggerAtMillis = null,
-                    humanTimeLabel = "Now"
-                )
+            val isMultiStep = lower.contains("home screen") || lower.contains("go home") ||
+                lower.contains("open a video") || lower.contains("open video") || lower.contains(",")
+            if (!isMultiStep) {
+                val cleaned = NaturalLanguageActionPlanner.extractCleanYouTubeSearchKeyword(query)
+                if (cleaned.length >= 2) {
+                    return ParsedAutomationTask(
+                        taskType = TASK_TYPE_YOUTUBE_PLAY,
+                        target = cleaned,
+                        messageText = "",
+                        appPackage = "com.google.android.youtube",
+                        triggerAtMillis = null,
+                        humanTimeLabel = "Now"
+                    )
+                }
             }
         }
 

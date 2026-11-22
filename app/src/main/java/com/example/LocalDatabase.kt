@@ -346,9 +346,20 @@ interface ScheduledTaskDao {
         ScheduledCallEntity::class,
         PendingCallAlertEntity::class,
         UserMemoryEntity::class,
-        ScheduledTaskEntity::class
+        ScheduledTaskEntity::class,
+        ProjectMemoryEntity::class,
+        MissionRunEntity::class,
+        KnowledgeNodeEntity::class,
+        KnowledgeEdgeEntity::class,
+        ExecutionStrategyEntity::class,
+        PersonalCommandEntity::class,
+        ChessGameEntity::class,
+        YouTubeUploadEntity::class,
+        MonitoredYouTubeVideoEntity::class,
+        YouTubeViewHistoryEntity::class,
+        VideoClipEntity::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 abstract class JarvisDatabase : RoomDatabase() {
@@ -360,6 +371,15 @@ abstract class JarvisDatabase : RoomDatabase() {
     abstract fun pendingCallAlertDao(): PendingCallAlertDao
     abstract fun userMemoryDao(): UserMemoryDao
     abstract fun scheduledTaskDao(): ScheduledTaskDao
+    abstract fun projectMemoryDao(): ProjectMemoryDao
+    abstract fun missionRunDao(): MissionRunDao
+    abstract fun knowledgeGraphDao(): KnowledgeGraphDao
+    abstract fun executionStrategyDao(): ExecutionStrategyDao
+    abstract fun personalCommandDao(): PersonalCommandDao
+    abstract fun chessGameDao(): ChessGameDao
+    abstract fun youTubeUploadDao(): YouTubeUploadDao
+    abstract fun youTubeMonitorDao(): YouTubeMonitorDao
+    abstract fun videoClipDao(): VideoClipDao
 
     companion object {
         @Volatile
@@ -471,6 +491,172 @@ abstract class JarvisDatabase : RoomDatabase() {
             }
         }
 
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS project_memories (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        title TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        progressSummary TEXT NOT NULL,
+                        decisionsLog TEXT NOT NULL,
+                        pendingTasksCsv TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        isCurrentActive INTEGER NOT NULL,
+                        updatedAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS mission_runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        goalCommand TEXT NOT NULL,
+                        stepsJson TEXT NOT NULL,
+                        completedSteps INTEGER NOT NULL,
+                        totalSteps INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS knowledge_nodes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        label TEXT NOT NULL,
+                        nodeType TEXT NOT NULL,
+                        details TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS knowledge_edges (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        fromNodeId INTEGER NOT NULL,
+                        toNodeId INTEGER NOT NULL,
+                        relation TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS execution_strategies (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        taskPattern TEXT NOT NULL,
+                        failedReason TEXT NOT NULL,
+                        improvedStrategy TEXT NOT NULL,
+                        requiresUserApproval INTEGER NOT NULL,
+                        approvedByUser INTEGER NOT NULL,
+                        successCount INTEGER NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS personal_commands (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        triggerPhrase TEXT NOT NULL,
+                        workflowStepsText TEXT NOT NULL,
+                        spokenConfirmation TEXT NOT NULL,
+                        runCount INTEGER NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS chess_games (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        title TEXT NOT NULL,
+                        fen TEXT NOT NULL,
+                        movesHistoryCsv TEXT NOT NULL,
+                        difficulty INTEGER NOT NULL,
+                        playerSide TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        moveCount INTEGER NOT NULL,
+                        updatedAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS youtube_uploads (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        uploadType TEXT NOT NULL,
+                        localVideoUri TEXT NOT NULL,
+                        thumbnailUri TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        tagsCsv TEXT NOT NULL,
+                        privacyStatus TEXT NOT NULL,
+                        scheduledPublishIso TEXT NOT NULL,
+                        youtubeVideoId TEXT NOT NULL,
+                        channelId TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        progressPercent INTEGER NOT NULL,
+                        errorMessage TEXT NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS monitored_youtube_videos (
+                        videoId TEXT PRIMARY KEY NOT NULL,
+                        title TEXT NOT NULL,
+                        thumbnailUrl TEXT NOT NULL,
+                        channelId TEXT NOT NULL,
+                        currentViews INTEGER NOT NULL,
+                        previousViews INTEGER NOT NULL,
+                        currentLikes INTEGER NOT NULL,
+                        currentComments INTEGER NOT NULL,
+                        reachedMilestonesCsv TEXT NOT NULL,
+                        isActive INTEGER NOT NULL,
+                        lastCheckedAt INTEGER NOT NULL,
+                        addedAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS youtube_view_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        videoId TEXT NOT NULL,
+                        views INTEGER NOT NULL,
+                        likes INTEGER NOT NULL,
+                        comments INTEGER NOT NULL,
+                        recordedAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS video_clips (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        sourceUri TEXT NOT NULL,
+                        clipFilePath TEXT NOT NULL,
+                        thumbnailPath TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        hookReason TEXT NOT NULL,
+                        startMs INTEGER NOT NULL,
+                        endMs INTEGER NOT NULL,
+                        captionText TEXT NOT NULL,
+                        isVertical916 INTEGER NOT NULL,
+                        batchNumber INTEGER NOT NULL,
+                        createdAt INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): JarvisDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -478,7 +664,7 @@ abstract class JarvisDatabase : RoomDatabase() {
                     JarvisDatabase::class.java,
                     "jarvis_local_core.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                     .fallbackToDestructiveMigration(dropAllTables = true)
                     .build()
                     .also { INSTANCE = it }
@@ -496,6 +682,15 @@ class JarvisRepository(private val database: JarvisDatabase) {
     private val pendingCallAlertDao = database.pendingCallAlertDao()
     private val userMemoryDao = database.userMemoryDao()
     private val scheduledTaskDao = database.scheduledTaskDao()
+    private val projectMemoryDao = database.projectMemoryDao()
+    private val missionRunDao = database.missionRunDao()
+    private val knowledgeGraphDao = database.knowledgeGraphDao()
+    private val executionStrategyDao = database.executionStrategyDao()
+    private val personalCommandDao = database.personalCommandDao()
+    private val chessGameDao = database.chessGameDao()
+    private val youTubeUploadDao = database.youTubeUploadDao()
+    private val youTubeMonitorDao = database.youTubeMonitorDao()
+    private val videoClipDao = database.videoClipDao()
 
     val settingsFlow: Flow<SettingsEntity?> = settingsDao.observeSettings()
     val historyFlow: Flow<List<ChatHistoryEntity>> = chatHistoryDao.observeHistory()
@@ -505,6 +700,17 @@ class JarvisRepository(private val database: JarvisDatabase) {
     val pendingAlertsFlow: Flow<List<PendingCallAlertEntity>> = pendingCallAlertDao.observeAlerts()
     val memoriesFlow: Flow<List<UserMemoryEntity>> = userMemoryDao.observeMemories()
     val scheduledTasksFlow: Flow<List<ScheduledTaskEntity>> = scheduledTaskDao.observeScheduledTasks()
+    val projectsFlow: Flow<List<ProjectMemoryEntity>> = projectMemoryDao.observeProjects()
+    val missionsFlow: Flow<List<MissionRunEntity>> = missionRunDao.observeMissions()
+    val knowledgeNodesFlow: Flow<List<KnowledgeNodeEntity>> = knowledgeGraphDao.observeNodes()
+    val knowledgeEdgesFlow: Flow<List<KnowledgeEdgeEntity>> = knowledgeGraphDao.observeEdges()
+    val strategiesFlow: Flow<List<ExecutionStrategyEntity>> = executionStrategyDao.observeStrategies()
+    val personalCommandsFlow: Flow<List<PersonalCommandEntity>> = personalCommandDao.observeCommands()
+    val chessGamesFlow: Flow<List<ChessGameEntity>> = chessGameDao.observeGames()
+    val youtubeUploadsFlow: Flow<List<YouTubeUploadEntity>> = youTubeUploadDao.observeUploads()
+    val monitoredVideosFlow: Flow<List<MonitoredYouTubeVideoEntity>> = youTubeMonitorDao.observeMonitoredVideos()
+    val viewHistoryFlow: Flow<List<YouTubeViewHistoryEntity>> = youTubeMonitorDao.observeViewHistory()
+    val videoClipsFlow: Flow<List<VideoClipEntity>> = videoClipDao.observeClips()
 
     suspend fun ensureDefaultsInitialized(): SettingsEntity {
         val existing = settingsDao.getSettingsOnce()
@@ -644,4 +850,126 @@ class JarvisRepository(private val database: JarvisDatabase) {
     suspend fun deleteScheduledTask(task: ScheduledTaskEntity) {
         scheduledTaskDao.deleteTask(task)
     }
+
+    // --- Infinite Project Memory ---
+    suspend fun getActiveProject(): ProjectMemoryEntity? = projectMemoryDao.getActiveProjectOnce()
+
+    suspend fun getAllProjects(): List<ProjectMemoryEntity> = projectMemoryDao.getAllProjectsOnce()
+
+    suspend fun saveProject(project: ProjectMemoryEntity, setActive: Boolean = false): Long {
+        if (setActive) projectMemoryDao.clearActiveFlags()
+        val toSave = project.copy(
+            isCurrentActive = if (setActive) true else project.isCurrentActive,
+            updatedAt = System.currentTimeMillis()
+        )
+        return projectMemoryDao.upsertProject(toSave)
+    }
+
+    suspend fun setActiveProject(project: ProjectMemoryEntity) {
+        projectMemoryDao.clearActiveFlags()
+        projectMemoryDao.upsertProject(project.copy(isCurrentActive = true, updatedAt = System.currentTimeMillis()))
+    }
+
+    suspend fun deleteProject(project: ProjectMemoryEntity) = projectMemoryDao.deleteProject(project)
+
+    // --- Mission Mode ---
+    suspend fun saveMission(mission: MissionRunEntity): Long = missionRunDao.upsertMission(mission)
+
+    suspend fun deleteMission(mission: MissionRunEntity) = missionRunDao.deleteMission(mission)
+
+    // --- Knowledge Graph ---
+    suspend fun upsertKnowledgeNode(label: String, nodeType: String, details: String = ""): Long {
+        val clean = label.trim()
+        val existing = knowledgeGraphDao.findNodeByLabel(clean)
+        return if (existing != null) {
+            knowledgeGraphDao.upsertNode(
+                existing.copy(details = details.ifBlank { existing.details })
+            )
+            existing.id
+        } else {
+            knowledgeGraphDao.upsertNode(
+                KnowledgeNodeEntity(label = clean, nodeType = nodeType, details = details)
+            )
+        }
+    }
+
+    suspend fun linkKnowledgeNodes(fromNodeId: Long, toNodeId: Long, relation: String): Long {
+        return knowledgeGraphDao.insertEdge(
+            KnowledgeEdgeEntity(fromNodeId = fromNodeId, toNodeId = toNodeId, relation = relation)
+        )
+    }
+
+    suspend fun getKnowledgeNodes(): List<KnowledgeNodeEntity> = knowledgeGraphDao.getNodesOnce()
+
+    suspend fun deleteKnowledgeNode(node: KnowledgeNodeEntity) {
+        knowledgeGraphDao.deleteEdgesForNode(node.id)
+        knowledgeGraphDao.deleteNode(node)
+    }
+
+    // --- Self-Improvement Engine ---
+    suspend fun saveExecutionStrategy(strategy: ExecutionStrategyEntity): Long =
+        executionStrategyDao.upsertStrategy(strategy)
+
+    suspend fun getAllExecutionStrategies(): List<ExecutionStrategyEntity> =
+        executionStrategyDao.getAllStrategiesOnce()
+
+    suspend fun deleteExecutionStrategy(strategy: ExecutionStrategyEntity) =
+        executionStrategyDao.deleteStrategy(strategy)
+
+    // --- Personal Command Language ---
+    suspend fun savePersonalCommand(command: PersonalCommandEntity): Long =
+        personalCommandDao.upsertCommand(command)
+
+    suspend fun getAllPersonalCommands(): List<PersonalCommandEntity> =
+        personalCommandDao.getAllCommandsOnce()
+
+    suspend fun deletePersonalCommand(command: PersonalCommandEntity) =
+        personalCommandDao.deleteCommand(command)
+
+    // --- Persistent AI Chess ---
+    suspend fun getLatestActiveChessGame(): ChessGameEntity? = chessGameDao.getLatestActiveGameOnce()
+
+    suspend fun getChessGameById(id: Long): ChessGameEntity? = chessGameDao.getGameById(id)
+
+    suspend fun saveChessGame(game: ChessGameEntity): Long =
+        chessGameDao.upsertGame(game.copy(updatedAt = System.currentTimeMillis()))
+
+    suspend fun deleteChessGame(game: ChessGameEntity) = chessGameDao.deleteGame(game)
+
+    // --- YouTube Uploads ---
+    suspend fun saveYouTubeUpload(upload: YouTubeUploadEntity): Long = youTubeUploadDao.upsertUpload(upload)
+
+    suspend fun getYouTubeUploadById(id: Long): YouTubeUploadEntity? = youTubeUploadDao.getUploadById(id)
+
+    suspend fun deleteYouTubeUpload(upload: YouTubeUploadEntity) = youTubeUploadDao.deleteUpload(upload)
+
+    // --- YouTube Milestone Monitoring ---
+    suspend fun upsertMonitoredVideo(video: MonitoredYouTubeVideoEntity) =
+        youTubeMonitorDao.upsertMonitoredVideo(video)
+
+    suspend fun getActiveMonitoredVideos(): List<MonitoredYouTubeVideoEntity> =
+        youTubeMonitorDao.getActiveMonitoredVideosOnce()
+
+    suspend fun getMonitoredVideoById(videoId: String): MonitoredYouTubeVideoEntity? =
+        youTubeMonitorDao.getVideoById(videoId)
+
+    suspend fun deleteMonitoredVideo(video: MonitoredYouTubeVideoEntity) =
+        youTubeMonitorDao.deleteMonitoredVideo(video)
+
+    suspend fun recordVideoViewSnapshot(videoId: String, views: Long, likes: Long, comments: Long) {
+        youTubeMonitorDao.insertViewSnapshot(
+            YouTubeViewHistoryEntity(videoId = videoId, views = views, likes = likes, comments = comments)
+        )
+    }
+
+    suspend fun getViewHistoryForVideo(videoId: String): List<YouTubeViewHistoryEntity> =
+        youTubeMonitorDao.getHistoryForVideo(videoId)
+
+    // --- AI Clipping Studio ---
+    suspend fun saveVideoClip(clip: VideoClipEntity): Long = videoClipDao.upsertClip(clip)
+
+    suspend fun getClipsForSource(sourceUri: String): List<VideoClipEntity> =
+        videoClipDao.getClipsForSource(sourceUri)
+
+    suspend fun deleteVideoClip(clip: VideoClipEntity) = videoClipDao.deleteClip(clip)
 }

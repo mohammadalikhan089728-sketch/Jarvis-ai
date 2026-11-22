@@ -36,6 +36,7 @@ class BootReceiver : BroadcastReceiver() {
                 if (settings.onlineAutoCallEnabled) {
                     NetworkMonitorService.start(appContext)
                 }
+                YouTubeMilestoneMonitorScheduler.syncPeriodicSchedule(appContext)
             } finally {
                 pendingResult.finish()
             }

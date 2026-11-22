@@ -2,8 +2,28 @@ package com.example
 
 import android.content.Context
 import android.media.AudioManager
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import org.json.JSONObject
 import java.util.Locale
+
+/**
+ * Lightweight in-app navigation bus so voice commands (e.g., "play chess", "open youtube studio")
+ * seamlessly open the corresponding JARVIS screen without breaking backstack state.
+ */
+object JarvisNavigationEvents {
+    const val TARGET_CHESS = "NAV_CHESS"
+    const val TARGET_YOUTUBE = "NAV_YOUTUBE"
+    const val TARGET_INTEL = "NAV_INTEL"
+
+    private val _events = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    val events: SharedFlow<String> = _events.asSharedFlow()
+
+    fun requestNavigate(target: String) {
+        _events.tryEmit(target)
+    }
+}
 
 data class RelativeDelayMatch(
     val delayMillis: Long,
@@ -136,6 +156,130 @@ class LocalCommandRouter(
         // Skip device navigation/hardware routing during an active call unless explicitly spoken
         if (inActiveCall) {
             return LocalRouteResult.NotHandled
+        }
+
+        // 4A. Persistent AI Chess Voice Commands ("play chess", "chess", "new chess game", "e2 to e4")
+        if (lower.contains("play chess") || lower == "chess" || lower.contains("open chess") ||
+            lower.contains("start chess") || lower.contains("chess khel") || lower.contains("new chess game")
+        ) {
+            val forceNew = lower.contains("new chess") || lower.contains("naya chess")
+            val activeGame = if (forceNew) null else repository.getLatestActiveChessGame()
+            if (activeGame == null) {
+                val created = ChessGameEntity(
+                    title = "JARVIS Match #${System.currentTimeMillis() % 1000}",
+                    fen = ChessBoardState.INITIAL_FEN,
+                    difficulty = CHESS_DIFFICULTY_TACTICAL,
+                    status = "IN_PROGRESS"
+                )
+                repository.saveChessGame(created)
+            }
+            JarvisNavigationEvents.requestNavigate(JarvisNavigationEvents.TARGET_CHESS)
+            val reply = if (activeGame != null) {
+                "Chessboard restored, Sir. Your saved match is ready — it's your move as White."
+            } else {
+                "Chessboard created, Sir. You play White and I play Black. Tap a piece or say a move like e2 to e4."
+            }
+            return LocalRouteResult.Handled(
+                actionTag = "LOCAL:CHESS_OPEN",
+                paramsJson = JSONObject().put("resumed", activeGame != null).toString(),
+                reply = reply
+            )
+        }
+
+        val parsedVoiceChessMove = JarvisChessAiEngine.parseVoiceMove(query)
+        if (parsedVoiceChessMove != null && (lower.contains("move ") || lower.contains(" to ") || lower.contains("chess"))) {
+            val activeGame = repository.getLatestActiveChessGame()
+            if (activeGame != null && activeGame.status == "IN_PROGRESS") {
+                val board = ChessBoardState.fromFen(activeGame.fen)
+                val afterUser = board.applyUciMove(parsedVoiceChessMove)
+                if (afterUser == null) {
+                    return LocalRouteResult.Handled(
+                        actionTag = "LOCAL:CHESS_ILLEGAL",
+                        paramsJson = JSONObject().put("move", parsedVoiceChessMove).toString(),
+                        reply = "Move $parsedVoiceChessMove is not a legal move in the current position, Sir."
+                    )
+                }
+                var updatedBoard = afterUser
+                var updatedHistory = listOf(activeGame.movesHistoryCsv, parsedVoiceChessMove)
+                    .filter { it.isNotBlank() }.joinToString(",")
+                var newMoveCount = activeGame.moveCount + 1
+                var lastMoveUci = parsedVoiceChessMove
+                var replyText = "Played $parsedVoiceChessMove."
+
+                val outcomeAfterUser = updatedBoard.evaluateOutcome()
+                if (outcomeAfterUser == ChessOutcome.IN_PROGRESS) {
+                    val aiMove = JarvisChessAiEngine.chooseBestMove(updatedBoard, activeGame.difficulty)
+                    if (aiMove != null) {
+                        val aiApplied = updatedBoard.applyMove(aiMove)
+                        if (aiApplied != null) {
+                            updatedBoard = aiApplied
+                            val aiUci = aiMove.toUci()
+                            updatedHistory = "$updatedHistory,$aiUci"
+                            newMoveCount++
+                            lastMoveUci = aiUci
+                            replyText = "You played $parsedVoiceChessMove. JARVIS responds with $aiUci."
+                        }
+                    }
+                }
+                val finalOutcome = updatedBoard.evaluateOutcome()
+                val statusStr = when (finalOutcome) {
+                    ChessOutcome.IN_PROGRESS -> "IN_PROGRESS"
+                    ChessOutcome.CHECKMATE_WHITE_WINS -> "CHECKMATE_USER"
+                    ChessOutcome.CHECKMATE_BLACK_WINS -> "CHECKMATE_JARVIS"
+                    ChessOutcome.STALEMATE -> "STALEMATE"
+                    ChessOutcome.DRAW_FIFTY_MOVE, ChessOutcome.DRAW_INSUFFICIENT_MATERIAL -> "DRAW"
+                }
+                if (finalOutcome != ChessOutcome.IN_PROGRESS) {
+                    replyText += " Game status: ${statusStr.replace('_', ' ')}."
+                }
+                repository.saveChessGame(
+                    activeGame.copy(
+                        fen = updatedBoard.toFen(),
+                        movesHistoryCsv = updatedHistory,
+                        moveCount = newMoveCount,
+                        status = statusStr,
+                        updatedAt = System.currentTimeMillis()
+                    )
+                )
+                JarvisNavigationEvents.requestNavigate(JarvisNavigationEvents.TARGET_CHESS)
+                return LocalRouteResult.Handled(
+                    actionTag = "LOCAL:CHESS_MOVE",
+                    paramsJson = JSONObject().put("userMove", parsedVoiceChessMove).put("lastMove", lastMoveUci).toString(),
+                    reply = replyText
+                )
+            }
+        }
+
+        // 4A-2. Open YouTube Creator Control Center by voice
+        if (lower.contains("youtube studio") || lower.contains("creator control") ||
+            lower.contains("youtube upload") || lower.contains("clipping studio")
+        ) {
+            JarvisNavigationEvents.requestNavigate(JarvisNavigationEvents.TARGET_YOUTUBE)
+            return LocalRouteResult.Handled(
+                actionTag = "LOCAL:OPEN_YOUTUBE_CREATOR",
+                paramsJson = "{}",
+                reply = "Opening JARVIS YouTube Creator Control Center, Sir."
+            )
+        }
+
+        // 4A-3. Sequential Natural-Language Action Planner (Fixes multi-step YouTube voice command bug!)
+        //       e.g., "Go to home screen, open YouTube, search MrBeast, open a video and play it."
+        NaturalLanguageActionPlanner.planCommand(query)?.let { workflow ->
+            val outcome = NaturalLanguageActionPlanner.executeWorkflow(
+                context = appContext,
+                workflow = workflow,
+                offlineProcessor = offlineProcessor,
+                repository = repository
+            )
+            return LocalRouteResult.Handled(
+                actionTag = if (outcome.succeeded) "LOCAL:WORKFLOW_OK" else "LOCAL:WORKFLOW_PARTIAL",
+                paramsJson = JSONObject()
+                    .put("keyword", workflow.extractedSearchKeyword)
+                    .put("completedSteps", outcome.completedSteps)
+                    .put("totalSteps", outcome.totalSteps)
+                    .toString(),
+                reply = outcome.spokenReply
+            )
         }
 
         // 4B. Universal Instant & Scheduled Social / App / Alarm / Media Automation (0 API tokens!)

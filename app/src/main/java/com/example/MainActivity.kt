@@ -24,11 +24,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AutoFixHigh
+import androidx.compose.material.icons.filled.Hub
+import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.outlined.AutoFixHigh
+import androidx.compose.material.icons.outlined.Hub
+import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.Radar
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Settings
@@ -44,7 +46,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -61,14 +67,20 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.example.ui.HudScreen
+import com.example.ui.INTEL_TAB_CHESS
+import com.example.ui.INTEL_TAB_PROJECTS
+import com.example.ui.IntelligenceHubScreen
 import com.example.ui.MacrosScreen
 import com.example.ui.PermissionsScreen
+import com.example.ui.YouTubeCreatorScreen
 import com.example.ui.theme.ArcCyan
 import com.example.ui.theme.DeepHudNavy
 import com.example.ui.theme.JarvisTheme
 import com.example.ui.theme.ObsidianVoid
 
 const val ROUTE_HUD = "hud"
+const val ROUTE_INTEL = "intel"
+const val ROUTE_YOUTUBE = "youtube"
 const val ROUTE_MACROS = "macros"
 const val ROUTE_PERMISSIONS = "permissions"
 const val ROUTE_SETTINGS = "settings"
@@ -82,7 +94,8 @@ private data class JarvisNavItem(
 
 private val NAV_ITEMS = listOf(
     JarvisNavItem(ROUTE_HUD, R.string.nav_hud, Icons.Filled.Radar, Icons.Outlined.Radar),
-    JarvisNavItem(ROUTE_MACROS, R.string.nav_macros, Icons.Filled.AutoFixHigh, Icons.Outlined.AutoFixHigh),
+    JarvisNavItem(ROUTE_INTEL, R.string.nav_intel, Icons.Filled.Hub, Icons.Outlined.Hub),
+    JarvisNavItem(ROUTE_YOUTUBE, R.string.nav_youtube, Icons.Filled.PlayCircle, Icons.Outlined.PlayCircle),
     JarvisNavItem(ROUTE_PERMISSIONS, R.string.nav_permissions, Icons.Filled.Security, Icons.Outlined.Security),
     JarvisNavItem(ROUTE_SETTINGS, R.string.nav_settings, Icons.Filled.Settings, Icons.Outlined.Settings)
 )
@@ -210,6 +223,39 @@ private fun JarvisRootApp(
     val lastVoiceStatus by viewModel.lastVoiceStatus.collectAsStateWithLifecycle()
     val wakeWordServiceRunning by viewModel.wakeWordServiceRunning.collectAsStateWithLifecycle()
 
+    // New Upgrade Module StateFlows
+    val creatorConfig by viewModel.creatorConfig.collectAsStateWithLifecycle()
+    val oauthStatus by viewModel.oauthStatus.collectAsStateWithLifecycle()
+    val youtubeTestStatus by viewModel.youtubeTestStatus.collectAsStateWithLifecycle()
+    val projects by viewModel.projects.collectAsStateWithLifecycle()
+    val missions by viewModel.missions.collectAsStateWithLifecycle()
+    val knowledgeNodes by viewModel.knowledgeNodes.collectAsStateWithLifecycle()
+    val knowledgeEdges by viewModel.knowledgeEdges.collectAsStateWithLifecycle()
+    val executionStrategies by viewModel.executionStrategies.collectAsStateWithLifecycle()
+    val personalCommands by viewModel.personalCommands.collectAsStateWithLifecycle()
+    val chessGames by viewModel.chessGames.collectAsStateWithLifecycle()
+    val activeChessGame by viewModel.activeChessGame.collectAsStateWithLifecycle()
+    val chessAiThinking by viewModel.chessAiThinking.collectAsStateWithLifecycle()
+    val chessStatusMessage by viewModel.chessStatusMessage.collectAsStateWithLifecycle()
+    val devModeOutput by viewModel.devModeOutput.collectAsStateWithLifecycle()
+    val whatIfOutput by viewModel.whatIfOutput.collectAsStateWithLifecycle()
+    val isIntelBusy by viewModel.isIntelBusy.collectAsStateWithLifecycle()
+    val intelStatusMessage by viewModel.intelStatusMessage.collectAsStateWithLifecycle()
+    val youtubeUploads by viewModel.youtubeUploads.collectAsStateWithLifecycle()
+    val monitoredVideos by viewModel.monitoredVideos.collectAsStateWithLifecycle()
+    val videoClips by viewModel.videoClips.collectAsStateWithLifecycle()
+    val uploadProgress by viewModel.uploadProgress.collectAsStateWithLifecycle()
+    val generatedSeo by viewModel.generatedSeo.collectAsStateWithLifecycle()
+    val publicVideoAnalytics by viewModel.publicVideoAnalytics.collectAsStateWithLifecycle()
+    val channelAnalytics by viewModel.channelAnalytics.collectAsStateWithLifecycle()
+    val videoAuditReport by viewModel.videoAuditReport.collectAsStateWithLifecycle()
+    val youtubeStrategyReport by viewModel.youtubeStrategyReport.collectAsStateWithLifecycle()
+    val clippingStatus by viewModel.clippingStatus.collectAsStateWithLifecycle()
+    val isYouTubeBusy by viewModel.isYouTubeBusy.collectAsStateWithLifecycle()
+    val youtubeStatusMessage by viewModel.youtubeStatusMessage.collectAsStateWithLifecycle()
+
+    var intelRequestedTab by rememberSaveable { mutableIntStateOf(INTEL_TAB_PROJECTS) }
+
     // Keep screen awake during active continuous live conversation and release on stop
     DisposableEffect(isLiveSessionActive) {
         onKeepScreenOnChanged(isLiveSessionActive)
@@ -269,6 +315,24 @@ private fun JarvisRootApp(
             }
             launchSingleTop = true
             restoreState = true
+        }
+    }
+
+    // Respond to voice-triggered screen navigation (e.g., "play chess", "open youtube studio")
+    LaunchedEffect(Unit) {
+        JarvisNavigationEvents.events.collect { target ->
+            when (target) {
+                JarvisNavigationEvents.TARGET_CHESS -> {
+                    intelRequestedTab = INTEL_TAB_CHESS
+                    navigateTopLevel(ROUTE_INTEL)
+                }
+                JarvisNavigationEvents.TARGET_YOUTUBE -> {
+                    navigateTopLevel(ROUTE_YOUTUBE)
+                }
+                JarvisNavigationEvents.TARGET_INTEL -> {
+                    navigateTopLevel(ROUTE_INTEL)
+                }
+            }
         }
     }
 
@@ -448,6 +512,89 @@ private fun JarvisRootApp(
                             )
                         }
 
+                        composable(ROUTE_INTEL) {
+                            IntelligenceHubScreen(
+                                initialTab = intelRequestedTab,
+                                projects = projects,
+                                missions = missions,
+                                knowledgeNodes = knowledgeNodes,
+                                knowledgeEdges = knowledgeEdges,
+                                strategies = executionStrategies,
+                                personalCommands = personalCommands,
+                                chessGames = chessGames,
+                                activeChessGame = activeChessGame,
+                                chessAiThinking = chessAiThinking,
+                                chessStatusMessage = chessStatusMessage,
+                                macros = macros,
+                                accessibilityActive = permissions.accessibilityActive,
+                                devModeOutput = devModeOutput,
+                                whatIfOutput = whatIfOutput,
+                                isIntelBusy = isIntelBusy,
+                                intelStatusMessage = intelStatusMessage,
+                                onSaveProject = viewModel::saveProjectMemory,
+                                onResumeProject = viewModel::resumeProjectMemory,
+                                onDeleteProject = viewModel::deleteProjectMemory,
+                                onRunMission = viewModel::runMissionGoal,
+                                onDeleteMission = viewModel::deleteMissionRun,
+                                onRunDevMode = viewModel::runDeveloperMode,
+                                onRunWhatIf = viewModel::runWhatIfSimulation,
+                                onSyncKnowledgeGraph = viewModel::syncKnowledgeGraph,
+                                onAddKnowledgeLink = viewModel::addKnowledgeLink,
+                                onDeleteKnowledgeNode = viewModel::deleteKnowledgeNode,
+                                onToggleApproveStrategy = viewModel::toggleApproveStrategy,
+                                onDeleteStrategy = viewModel::deleteExecutionStrategy,
+                                onSavePersonalCommand = viewModel::savePersonalCommand,
+                                onRunPersonalCommand = viewModel::runPersonalCommand,
+                                onDeletePersonalCommand = viewModel::deletePersonalCommand,
+                                onCreateChessGame = viewModel::createNewChessGame,
+                                onSelectChessGame = viewModel::selectChessGame,
+                                onDeleteChessGame = viewModel::deleteChessGame,
+                                onMakeChessMove = viewModel::makeChessMove,
+                                onMakeChessUciMove = viewModel::makeChessUciMove,
+                                onResignChessGame = viewModel::resignActiveChessGame,
+                                onAddMacro = viewModel::addCustomMacro,
+                                onDeleteMacro = viewModel::deleteCustomMacro,
+                                onRunMacro = { macro -> viewModel.submitCommand(macro.triggerPhrase) },
+                                onRunGestureTest = viewModel::runDirectGestureTest
+                            )
+                        }
+
+                        composable(ROUTE_YOUTUBE) {
+                            YouTubeCreatorScreen(
+                                config = creatorConfig,
+                                uploads = youtubeUploads,
+                                monitoredVideos = monitoredVideos,
+                                clips = videoClips,
+                                uploadProgress = uploadProgress,
+                                generatedSeo = generatedSeo,
+                                publicVideoAnalytics = publicVideoAnalytics,
+                                channelAnalytics = channelAnalytics,
+                                videoAuditReport = videoAuditReport,
+                                youtubeStrategyReport = youtubeStrategyReport,
+                                clippingStatus = clippingStatus,
+                                isBusy = isYouTubeBusy,
+                                statusMessage = youtubeStatusMessage,
+                                onOpenSettings = { navigateTopLevel(ROUTE_SETTINGS) },
+                                onGenerateSeo = viewModel::generateYouTubeSeo,
+                                onStartUpload = viewModel::startYouTubeVideoUpload,
+                                onRetryUpload = viewModel::retryFailedYouTubeUpload,
+                                onSaveCommunityDraft = viewModel::saveCommunityPostDraft,
+                                onGenerateCommunityCopy = viewModel::generateCommunityPostCopy,
+                                onFetchPublicVideo = viewModel::fetchPublicVideoAnalytics,
+                                onFetchChannelAnalytics = viewModel::fetchAuthorizedChannelAnalytics,
+                                onAddMonitoredVideo = viewModel::addMonitoredYouTubeVideo,
+                                onDeleteMonitoredVideo = viewModel::deleteMonitoredYouTubeVideo,
+                                onCheckMilestonesNow = viewModel::checkYouTubeMilestonesNow,
+                                onTestMilestoneCall = viewModel::triggerTestYouTubeMilestoneCall,
+                                onRunVideoAudit = viewModel::runGeminiPreUploadVideoAudit,
+                                onGenerateFourClips = viewModel::generateFourVideoClips,
+                                onEditAndReExportClip = viewModel::editAndReExportVideoClip,
+                                onExportClipToSaf = viewModel::exportVideoClipToSaf,
+                                onDeleteClip = viewModel::deleteVideoClip,
+                                onGenerateStrategy = viewModel::generateYouTubeChannelStrategy
+                            )
+                        }
+
                         composable(ROUTE_MACROS) {
                             MacrosScreen(
                                 macros = macros,
@@ -517,7 +664,16 @@ private fun JarvisRootApp(
                                 onAddUserMemory = viewModel::addUserMemory,
                                 onDeleteUserMemory = viewModel::deleteUserMemory,
                                 onTestIncomingCall = viewModel::triggerTestIncomingCall,
-                                onTestScreenTap = ::runDiagnosticTapWithToast
+                                onTestScreenTap = ::runDiagnosticTapWithToast,
+                                creatorConfig = creatorConfig,
+                                oauthStatus = oauthStatus,
+                                youtubeTestStatus = youtubeTestStatus,
+                                onSaveCreatorConfig = viewModel::saveCreatorConfig,
+                                onStartYouTubeOAuth = { clientId -> viewModel.startYouTubeOAuth(context, clientId) },
+                                onTestYouTubeConnection = viewModel::testYouTubeConnection,
+                                onDisconnectYouTube = viewModel::disconnectYouTubeAccount,
+                                onTestMilestoneCall = viewModel::triggerTestYouTubeMilestoneCall,
+                                onOpenYouTubeControlCenter = { navigateTopLevel(ROUTE_YOUTUBE) }
                             )
                         }
                     }

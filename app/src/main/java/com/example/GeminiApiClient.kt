@@ -1094,6 +1094,198 @@ Rules:
         }
     }
 
+    /**
+     * Rich structured/long-form AI generation reusing the user's EXISTING Gemini API key and engine chain.
+     * Used by AI Developer Mode, What-If Simulator, Mission Mode planning, Self-Improvement analysis,
+     * YouTube SEO generation, and AI YouTube Strategy Assistant (higher token budget than short voice turns).
+     */
+    suspend fun generateLongAnalysis(
+        rawApiKey: String,
+        systemInstruction: String,
+        userPrompt: String,
+        selectedEngine: String = ENGINE_V25_LITE,
+        maxOutputTokens: Int = 1400,
+        expectJson: Boolean = false
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val apiKey = rawApiKey.trim()
+        if (apiKey.isEmpty()) {
+            return@withContext Result.failure(
+                IllegalStateException("JARVIS AI Core key missing. Configure your key once in Config.")
+            )
+        }
+        if (PersistentLiveAudioSession.isInQuotaCooldown()) {
+            return@withContext Result.failure(
+                IllegalStateException("Quota protection cooldown active (${PersistentLiveAudioSession.remainingCooldownSeconds()}s).")
+            )
+        }
+
+        val chain = resolveEngineChain(selectedEngine)
+        var lastErr: Throwable = IllegalStateException("Unable to reach JARVIS AI Core.")
+
+        for (spec in chain) {
+            try {
+                val payload = JSONObject().apply {
+                    put(
+                        "systemInstruction",
+                        JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemInstruction)))
+                    )
+                    put(
+                        "contents",
+                        JSONArray().put(
+                            JSONObject().apply {
+                                put("role", "user")
+                                put("parts", JSONArray().put(JSONObject().put("text", userPrompt)))
+                            }
+                        )
+                    )
+                    put(
+                        "generationConfig",
+                        JSONObject().apply {
+                            put("temperature", if (expectJson) 0.25 else 0.55)
+                            put("maxOutputTokens", maxOutputTokens.coerceIn(256, 4096))
+                            if (expectJson) {
+                                put("responseMimeType", "application/json")
+                            }
+                        }
+                    )
+                }
+
+                val request = Request.Builder()
+                    .url(generateUrl(spec.modelId))
+                    .header("x-goog-api-key", apiKey)
+                    .header("Content-Type", "application/json")
+                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (response.isSuccessful) {
+                        val text = extractCandidateText(body).trim()
+                        if (text.isNotEmpty()) {
+                            return@withContext Result.success(text)
+                        }
+                        lastErr = IllegalStateException("Empty analysis response.")
+                    } else {
+                        val apiErr = sanitizeErrorText(extractApiErrorMessage(body))
+                        val msg = "JARVIS AI Core error ${response.code}: ${apiErr.ifBlank { response.message }}"
+                        lastErr = IllegalStateException(msg)
+                        if (!shouldFailoverHttpCode(response.code)) {
+                            return@withContext Result.failure(lastErr)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                lastErr = e
+                return@withContext Result.failure(e)
+            }
+        }
+        Result.failure(lastErr)
+    }
+
+    /**
+     * Multimodal video keyframe + metadata analysis reusing the user's EXISTING Gemini API key.
+     * Accepts sampled JPEG frames (base64 encoded) plus video duration/audio/transcript metadata for
+     * Pre-Upload Video Audits and AI Clipping Studio 4-moment extraction.
+     */
+    suspend fun generateMultimodalVideoAnalysis(
+        rawApiKey: String,
+        systemInstruction: String,
+        promptText: String,
+        jpegFramesBase64: List<String>,
+        selectedEngine: String = ENGINE_V25_LITE,
+        maxOutputTokens: Int = 1600,
+        expectJson: Boolean = false
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val apiKey = rawApiKey.trim()
+        if (apiKey.isEmpty()) {
+            return@withContext Result.failure(
+                IllegalStateException("JARVIS AI Core key missing. Configure your key once in Config.")
+            )
+        }
+        if (PersistentLiveAudioSession.isInQuotaCooldown()) {
+            return@withContext Result.failure(
+                IllegalStateException("Quota protection cooldown active (${PersistentLiveAudioSession.remainingCooldownSeconds()}s).")
+            )
+        }
+
+        val partsArray = JSONArray()
+        partsArray.put(JSONObject().put("text", promptText))
+        jpegFramesBase64.take(8).forEach { b64 ->
+            if (b64.isNotBlank()) {
+                partsArray.put(
+                    JSONObject().put(
+                        "inlineData",
+                        JSONObject()
+                            .put("mimeType", "image/jpeg")
+                            .put("data", b64)
+                    )
+                )
+            }
+        }
+
+        val chain = resolveEngineChain(selectedEngine)
+        var lastErr: Throwable = IllegalStateException("Multimodal analysis failed.")
+
+        for (spec in chain) {
+            try {
+                val payload = JSONObject().apply {
+                    put(
+                        "systemInstruction",
+                        JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemInstruction)))
+                    )
+                    put(
+                        "contents",
+                        JSONArray().put(
+                            JSONObject().apply {
+                                put("role", "user")
+                                put("parts", partsArray)
+                            }
+                        )
+                    )
+                    put(
+                        "generationConfig",
+                        JSONObject().apply {
+                            put("temperature", if (expectJson) 0.25 else 0.45)
+                            put("maxOutputTokens", maxOutputTokens.coerceIn(512, 4096))
+                            if (expectJson) {
+                                put("responseMimeType", "application/json")
+                            }
+                        }
+                    )
+                }
+
+                val request = Request.Builder()
+                    .url(generateUrl(spec.modelId))
+                    .header("x-goog-api-key", apiKey)
+                    .header("Content-Type", "application/json")
+                    .post(payload.toString().toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+
+                httpClient.newCall(request).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (response.isSuccessful) {
+                        val text = extractCandidateText(body).trim()
+                        if (text.isNotEmpty()) {
+                            return@withContext Result.success(text)
+                        }
+                        lastErr = IllegalStateException("Empty multimodal response.")
+                    } else {
+                        val apiErr = sanitizeErrorText(extractApiErrorMessage(body))
+                        val msg = "JARVIS AI Core error ${response.code}: ${apiErr.ifBlank { response.message }}"
+                        lastErr = IllegalStateException(msg)
+                        if (!shouldFailoverHttpCode(response.code)) {
+                            return@withContext Result.failure(lastErr)
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                lastErr = e
+                return@withContext Result.failure(e)
+            }
+        }
+        Result.failure(lastErr)
+    }
+
     private fun extractApiErrorMessage(rawError: String): String {
         return try {
             JSONObject(rawError).optJSONObject("error")?.optString("message").orEmpty()
